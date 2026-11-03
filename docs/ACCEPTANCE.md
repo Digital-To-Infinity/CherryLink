@@ -12,7 +12,7 @@
 | M3 | Facebook + Instagram publishing adapters | CODED / NOT LIVE-TESTED | Official Meta calls not yet tested with owned assets |
 | M4 | DB jobs, row locks, advisory account lock, attempts | CODED / NOT STRESS-TESTED | Database concurrency tests required |
 | M4 | Ambiguous response quarantine | CODED / RECONCILIATION PARTIAL | Auto-safe recovery limited by provider reconciliation data |
-| M5 | Automated tests | WRITTEN / NOT EXECUTED | Network package install unavailable in work environment |
+| M5 | Baseline build and seven unit tests | CI PASSED | GitHub Actions (commit `84cf1b433`): npm install, npm run build, npm test (7 passed). This does not cover integration/E2E checks. |
 | M5 | Mobile, authorization, restart and duplicate tests | NOT RUN | Requires environment/dependencies and API mocking |
 | M6 | Persistent worker deployment | NOT RUN | Worker host, secrets, domain and monitoring required |
 | M6 | Production-ready status | NOT APPROVED | Must first pass all required live tests |

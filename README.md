@@ -1,7 +1,7 @@
 # CherryLink by DTI
 
 **Version:** v0.1 engineering foundation (NOT a production-complete v1.0)  
-**Status:** initial engineering source, schema and publishing adapters; compilation, live Meta proof and deployment sign-off pending  
+**Status:** initial engineering source, schema and publishing adapters; GitHub CI build + 7 unit tests passing, live Meta proof and deployment sign-off pending  
 **Owner:** Digital To Infinity  
 **Date:** 3 November 2026
 
