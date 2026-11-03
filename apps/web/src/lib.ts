@@ -1,6 +1,9 @@
 import {createClient} from '@supabase/supabase-js';
 import {formatInTimeZone,fromZonedTime} from 'date-fns-tz';
-export const supabase=createClient(import.meta.env.VITE_SUPABASE_URL||'https://placeholder.supabase.co',import.meta.env.VITE_SUPABASE_ANON_KEY||'placeholder');
+const supabaseUrl=import.meta.env.VITE_SUPABASE_URL?.trim();
+const publicKey=import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
+export const isSupabaseConfigured=Boolean(supabaseUrl?.startsWith('https://') && !/YOUR_PROJECT|placeholder/i.test(supabaseUrl) && publicKey && !/^YOUR_|^placeholder$/i.test(publicKey));
+export const supabase=createClient(isSupabaseConfigured?supabaseUrl!:'https://placeholder.supabase.co',isSupabaseConfigured?publicKey!:'placeholder');
 export const API_URL=import.meta.env.VITE_API_URL||'http://localhost:3001';
 export async function api(path:string,workspaceId:string|null=null,options:RequestInit={}):Promise<any>{
   const {data}=await supabase.auth.getSession();const token=data.session?.access_token;

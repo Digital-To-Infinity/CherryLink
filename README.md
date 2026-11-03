@@ -38,7 +38,9 @@ Always-on worker ---------------------|
 
 ```bash
 cp .env.example .env
-# Fill required variables in .env; use a fresh Supabase project.
+# Fill required variables in the repository-root .env; use a fresh Supabase project.
+# Vite, API and worker all load this root .env (only VITE_ variables enter the browser).
+# Do not copy META_APP_SECRET, DATABASE_URL, or SUPABASE_SERVICE_ROLE_KEY into browser code.
 npm install
 # Save generated package-lock.json before production deployment.
 # Apply migrations in order using your Supabase SQL editor:

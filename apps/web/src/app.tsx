@@ -1,6 +1,6 @@
 import React,{useEffect,useState,useCallback,useMemo} from 'react';
 import {CalendarDays,LayoutDashboard,Plus,Images,Clock3,History,Link2,Users,Settings,Menu,X,Sun,Moon,LogOut,Upload,AlertTriangle,CheckCircle2,ArrowRight,Loader2,RefreshCw,Instagram,Facebook,ChevronLeft,ChevronRight,Send,Save,Trash2,Edit3,ExternalLink,ShieldCheck,ShieldAlert,Wifi,WifiOff} from 'lucide-react';
-import {supabase,api,fmt,utcFromLocal,statusColor,type Account,type Post,type Media,type Target} from './lib';
+import {supabase,isSupabaseConfigured,api,fmt,utcFromLocal,statusColor,type Account,type Post,type Media,type Target} from './lib';
 import {Button} from './components/ui/button';
 import {addMonths,subMonths,startOfMonth,endOfMonth,startOfWeek,endOfWeek,eachDayOfInterval,format,isSameMonth,isSameDay} from 'date-fns';
 import type {Session} from '@supabase/supabase-js';
@@ -17,7 +17,17 @@ function Status({value}:{value:string}){return <span className={`badge ${statusC
 function PlatformIcon({platform,size=18}:{platform:string;size?:number}){return platform==='INSTAGRAM'?<Instagram size={size}/>:<Facebook size={size}/>}
 function Empty({title,description,action}:{title:string;description:string;action?:React.ReactNode}){return <div className="panel flex min-h-52 flex-col items-center justify-center gap-3 text-center"><div className="rounded-2xl bg-slate-100 p-3 text-slate-400 dark:bg-slate-800"><Images size={24}/></div><p className="font-semibold">{title}</p><p className="subtle max-w-md">{description}</p>{action}</div>}
 function SignIn(){const [email,setEmail]=useState('');const [sent,setSent]=useState(false);const [error,setError]=useState('');const [busy,setBusy]=useState(false);
- async function submit(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');const {error}=await supabase.auth.signInWithOtp({email,options:{emailRedirectTo:window.location.origin}});if(error)setError(error.message);else setSent(true);setBusy(false);}
+ async function submit(e:React.FormEvent){
+  e.preventDefault();setError('');
+  if(!isSupabaseConfigured){setError('Supabase is not configured. Add your CherryLink project URL and public API key to the repository-root .env, then restart Vite.');return;}
+  setBusy(true);
+  try{
+   const {error}=await supabase.auth.signInWithOtp({email,options:{emailRedirectTo:window.location.origin}});
+   if(error)setError(error.message==='Failed to fetch'?'Could not reach Supabase Auth. Check the CherryLink project URL and your network connection.':error.message);
+   else setSent(true);
+  }catch{setError('Could not reach Supabase Auth. Check the project URL and your network connection.');}
+  finally{setBusy(false);}
+ }
  return <main className="flex min-h-screen items-center justify-center p-5"><div className="panel w-full max-w-md p-8"><Logo/><h1 className="mt-10 text-3xl font-bold">Welcome back</h1><p className="subtle mt-2">Sign in to plan and publish social content with your team.</p>{sent?<div className="mt-8 rounded-xl bg-emerald-50 p-4 text-sm text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200">Check your inbox for the secure sign-in link. You can close this window after opening it.</div>:<form onSubmit={submit} className="mt-8 space-y-4"><div><label htmlFor="email" className="label">Work email</label><input id="email" className="input" type="email" placeholder="you@company.com" value={email} onChange={e=>setEmail(e.target.value)} required/></div>{error&&<p role="alert" className="text-sm text-rose-600">{error}</p>}<Button disabled={busy} className="w-full">{busy?'Sending link…':'Continue with email'}<ArrowRight size={16}/></Button></form>}<p className="mt-8 text-xs text-slate-400">Secure access via Supabase Auth. No Meta passwords are stored.</p></div></main>;
 }
 function SetupWorkspace({done}:{done:()=>void}){const [name,setName]=useState('Digital To Infinity');const [busy,setBusy]=useState(false);const [error,setError]=useState('');return <main className="flex min-h-screen items-center justify-center p-5"><div className="panel w-full max-w-lg p-8"><Logo/><h1 className="mt-10 text-2xl font-bold">Create your workspace</h1><p className="subtle mt-2">Keep DTI accounts, media and scheduled posts isolated from other workspaces.</p><form className="mt-7 space-y-5" onSubmit={async e=>{e.preventDefault();setBusy(true);try{await api('/api/workspaces',null,{method:'POST',body:JSON.stringify({name})});done();}catch(e){setError(String(e));}finally{setBusy(false);}}}><label className="block"><span className="label">Workspace name</span><input className="input" value={name} onChange={e=>setName(e.target.value)} required minLength={2}/></label>{error&&<p role="alert" className="text-rose-600 text-sm">{error}</p>}<Button disabled={busy}>Create workspace <ArrowRight size={16}/></Button></form></div></main>}

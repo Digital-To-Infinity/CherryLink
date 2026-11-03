@@ -1,4 +1,7 @@
-import 'dotenv/config';
+import {config as loadEnv} from 'dotenv';
+import {fileURLToPath} from 'node:url';
+// Stable in both packages/server/src and packages/server/dist; hosting env vars take precedence.
+loadEnv({path:fileURLToPath(new URL('../../../.env',import.meta.url)),quiet:true});
 import { z } from 'zod';
 const schema = z.object({
   NODE_ENV: z.enum(['development','test','production']).default('development'),
