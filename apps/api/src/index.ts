@@ -114,7 +114,6 @@ app.post('/api/connections/instagram/verify-asset',auth,member,admin,asyncRoute(
 }));
 
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:150*1024*1024,files:1}});
-const execFileAsync=promisify(execFile);
 async function inspectMedia(buffer:Buffer,mime:string){
   if(mime.startsWith('image/')){const meta=await sharp(buffer).metadata();if(!meta.width||!meta.height||meta.width<320||meta.height<320||meta.width>10000||meta.height>10000)throw bad('Image dimensions are unsupported');return {width:meta.width,height:meta.height,duration:null,videoCodec:null,audioCodec:null};}
   // FFprobe reads from stdin; no shell interpolation and no untrusted path.
