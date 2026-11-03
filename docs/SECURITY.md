@@ -1,0 +1,9 @@
+# Security and operational guarantees
+
+- **Data isolation:** API checks authenticated `workspace_members` for every workspace-scoped endpoint. Database FK constraints enforce post-to-account and media-to-workspace consistency. RLS allows members only to read their own workspaces via direct Supabase access; mutations require the server API.
+- **Credentials:** Store only AES-256-GCM ciphertext in `social_account_credentials`; encryption key only on API/worker hosts. Rotate keys with a planned data re-encryption job before changing key. Never log token values. OAuth state is single-use and SHA-256 hashed.
+- **Storage:** Private object bucket, workspace-prefixed paths. Authenticated preview URL life 10 minutes. Worker creates Meta-fetchable signed URL valid 2 hours at dispatch time. Configure appropriate signed-URL lifetimes for larger Reel ingestion processes.
+- **Scheduler:** Jobs durably saved in PostgreSQL. `FOR UPDATE SKIP LOCKED` protects claiming, while PG advisory locks prevent simultaneous delivery to one account. Lease expiry is deliberately quarantined as `UNKNOWN`, never automatically replayed.
+- **Safe retries:** HTTP 429 and explicit failures can be retried after delay; network timeouts and 5xx at final publish become UNKNOWN. Attempts and transitions are logged. Partial cross-platform publishing does not retry completed targets.
+- **Gaps before public launch:** Full reconciliation of ambiguous Facebook feed posts, Meta data deletion callbacks, verified token refresh strategy, stronger media virus scanning, RLS/policy penetration testing, operational alerts, worker/DB chaos tests, audit retention controls and broader Meta App Review are pending.
+- **Critical caution:** the RLS layer does not protect a stolen PostgreSQL owner credential or a Supabase service-role key; both must be strictly server-only. Set DB credentials to least privilege in production (migrations and runtime users should be different).

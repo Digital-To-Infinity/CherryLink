@@ -1,0 +1,1 @@
+{"name":"@cherrylink/worker","version":"0.1.0","type":"module","scripts":{"dev":"tsx watch src/index.ts","build":"tsc -p tsconfig.json","start":"node dist/index.js"},"dependencies":{"@cherrylink/server":"0.1.0","@cherrylink/shared":"0.1.0","pg":"^8.16.3","@supabase/supabase-js":"^2.81.0"},"devDependencies":{"@types/pg":"^8.15.5"}}
