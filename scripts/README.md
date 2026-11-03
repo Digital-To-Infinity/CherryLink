@@ -1,0 +1,1 @@
+Apply `supabase/migrations/0001_cherrylink.sql` in a **new** Supabase project using SQL editor or your migrations pipeline. Storage bucket is private and only server credentials may access it. Do not apply this migration to an existing DTI CRM or production database.
