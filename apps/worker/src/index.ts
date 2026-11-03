@@ -12,7 +12,7 @@ function classify(err:unknown,phase:'preflight'|'nonfinal'|'final'):{status:Publ
   const msg=e?`Meta rejected the publishing request (code ${e.code??'unknown'}).`:(err instanceof Error?err.message.slice(0,160):'Publishing error');
   if(e?.tokenInvalid)return {status:'ACTION_REQUIRED',code:'TOKEN_INVALID',message:'Meta connection expired or permissions changed. Reconnect the account.',delay:0};
   if(phase==='final' && (e?.uncertain||!e))return {status:'UNKNOWN',code:'PUBLISH_OUTCOME_UNKNOWN',message:'Meta may have published the content; reconciliation is required before retrying.',delay:0};
-  if(e?.retryable || (phase!=='final' && (e?.uncertain || err instanceof TypeError || (err instanceof Error && /network|abort|timed out/i.test(err.message)))))return {status:'RETRY_WAIT',code:'META_RETRYABLE',message:'Provider is temporarily unavailable or rate-limited.',delay:Math.max(e.retryAfter||0,60)};
+  if(e?.retryable || (phase!=='final' && (e?.uncertain || err instanceof TypeError || (err instanceof Error && /network|abort|timed out/i.test(err.message)))))return {status:'RETRY_WAIT',code:'META_RETRYABLE',message:'Provider is temporarily unavailable or rate-limited.',delay:Math.max(e?.retryAfter||0,60)};
   return {status:'FAILED',code:e?'PROVIDER_REJECTED':'INTERNAL_ERROR',message:msg,delay:0};
 }
 async function claim(client:PoolClient):Promise<Delivery|null>{
@@ -77,7 +77,7 @@ async function publishInstagram(d:Delivery,token:string):Promise<void>{
   if(!container){
     const mediaUrl=await signedMediaUrl(d);
     await markStage(d,'INSTAGRAM_CREATE_CONTAINER','PREPARING');
-    const params=d.content_type==='REEL'?{media_type:'REELS',video_url:mediaUrl,caption,share_to_feed:'true'}:{image_url:mediaUrl,caption};
+    const params:Record<string,string>=d.content_type==='REEL'?{media_type:'REELS',video_url:mediaUrl,caption,share_to_feed:'true'}:{image_url:mediaUrl,caption};
     const created=await graphPost('/'+d.provider_account_id+'/media',token,params);
     if(!created.id)throw new Error('Instagram did not return a media container ID');
     container=String(created.id);await pool.query('update post_targets set provider_container_id=$2 where id=$1',[d.target_id,container]);
@@ -126,7 +126,7 @@ async function publishFacebook(d:Delivery,token:string):Promise<void>{
     else{await complete(d,'UNKNOWN',{containerId:videoId!,code:'FACEBOOK_REEL_PROCESSING_UNCONFIRMED',message:'Facebook accepted the Reel finish request but final visibility is not confirmed. Reconciliation required.'});}
     return;
   }
-  const params=d.content_type==='TEXT'?{message:caption,published:'true'}:{url:await signedMediaUrl(d),caption,published:'true'};
+  const params:Record<string,string>=d.content_type==='TEXT'?{message:caption,published:'true'}:{url:await signedMediaUrl(d),caption,published:'true'};
   await markStage(d,'FACEBOOK_FINAL_PUBLISH','PUBLISHING');
   let posted:any;try{posted=await graphPost('/'+d.provider_account_id+(d.content_type==='TEXT'?'/feed':'/photos'),token,params);}
   catch(e){const state=classify(e,'final');await complete(d,state.status,{code:state.code,message:state.message,delaySeconds:state.delay});return;}
