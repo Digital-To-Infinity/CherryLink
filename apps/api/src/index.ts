@@ -240,72 +240,76 @@ app.get('/api/public/media/:id/:variant',asyncRoute(async(req,res)=>{
  res.send(bytes);
 }));
 app.post('/api/posts',auth,member,asyncRoute(async(req,res)=>{
-  const parsed=createPostSchema.safeParse(req.body);if(!parsed.success)throw bad(parsed.error.issues[0]?.message||'Invalid post');
-  const p=parsed.data;
-  if(p.mediaAssetId){const media=await pool.query<{mime_type:string;width:number;height:number;duration_seconds:string|null}>('select mime_type,width,height,duration_seconds from media_assets where id=$1 and workspace_id=$2 and processing_status=\'READY\'',[p.mediaAssetId,res.locals.workspaceId]);if(!media.rows.length)throw bad('Media is not available in this workspace');}
-  const accountRows=p.accountIds.length?await pool.query<{id:string;platform:'FACEBOOK'|'INSTAGRAM'}>(`select id,platform from social_accounts where workspace_id=$1 and connection_status='CONNECTED' and id=any($2::uuid[])`,[res.locals.workspaceId,p.accountIds]):{rows:[]};
-  const uniqueIds=new Set(p.accountIds);if(accountRows.rows.length!==uniqueIds.size)throw bad('One or more target accounts are disconnected or inaccessible');
-  const media=p.mediaAssetId?await pool.query<{mime_type:string;duration_seconds:string|null;width:number;height:number}>(`select mime_type,duration_seconds,width,height from media_assets where id=$1 and workspace_id=$2`,[p.mediaAssetId,res.locals.workspaceId]):null;
-  const asset=media?.rows[0];const mime=asset?.mime_type;
-  for(const a of accountRows.rows){
-    if(a.platform==='INSTAGRAM'&&!mime)throw bad('Instagram requires image or Reel media');
-    if(a.platform==='INSTAGRAM'&&mime?.startsWith('image/')){const ratio=asset!.width/asset!.height;if(ratio<0.8||ratio>1.91)throw bad('Instagram feed images require an aspect ratio between 4:5 and 1.91:1');}
-    if(a.platform==='FACEBOOK'&&mime==='video/mp4'){const duration=Number(asset!.duration_seconds),ratio=asset!.width/asset!.height;if(duration<4||duration>60||asset!.width<540||asset!.height<960||Math.abs(ratio-9/16)>0.02)throw bad('Facebook Reels require 9:16 video, at least 540×960, and 4–60 seconds');}
+ const parsed=createPostSchema.safeParse(req.body);if(!parsed.success)throw bad(parsed.error.issues[0]?.message||'Invalid post');
+ const p=parsed.data,ids=[...new Set(p.accountIds)];
+ const accounts=ids.length?await pool.query<{id:string;platform:'FACEBOOK'|'INSTAGRAM'}>(
+  "select id,platform from social_accounts where workspace_id=$1 and connection_status='CONNECTED' and id IN ($2)",[res.locals.workspaceId,ids]):{rows:[]};
+ if(accounts.rows.length!==ids.length)throw bad('One or more accounts are disconnected or inaccessible');
+ const media=p.mediaAssetId?await pool.query<{mime_type:string;width:number;height:number;duration_seconds:number}>(
+  "select mime_type,width,height,duration_seconds from media_assets where id=$1 and workspace_id=$2 and processing_status='READY'",[p.mediaAssetId,res.locals.workspaceId]):null;
+ if(p.mediaAssetId&&!media?.rows.length)throw bad('Media is not available in this workspace');
+ const asset=media?.rows[0];
+ for(const account of accounts.rows){
+  if(account.platform==='INSTAGRAM'&&!asset)throw bad('Instagram needs image or Reel media');
+  if(account.platform==='INSTAGRAM'&&asset?.mime_type.startsWith('image/')&&(asset.width/asset.height<0.8||asset.width/asset.height>1.91))throw bad('Instagram image aspect ratio must be 4:5 to 1.91:1');
+  if(account.platform==='FACEBOOK'&&asset?.mime_type==='video/mp4'&&(Number(asset.duration_seconds)>60||Number(asset.duration_seconds)<4||asset.width<540||asset.height<960||Math.abs(asset.width/asset.height-9/16)>0.02))throw bad('Facebook Reel dimensions or duration unsupported');
+ }
+ const when=p.saveDraft?null:new Date(p.scheduledAtUtc||Date.now()+10000);
+ if(when&&(!Number.isFinite(when.getTime())||when.getTime()<Date.now()-5000||when.getTime()>Date.now()+365*86400000))throw bad('Scheduled time is invalid');
+ const postId=newId(),client=await pool.connect();
+ try{await client.query('begin');
+  const zone=await client.query<{timezone:string}>('select timezone from workspaces where id=$1',[res.locals.workspaceId]);
+  await client.query('insert into posts(id,workspace_id,created_by,media_asset_id,caption,scheduled_at_utc,timezone,lifecycle_status,content_origin) values($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+   [postId,res.locals.workspaceId,res.locals.userId,p.mediaAssetId||null,p.caption,when?.toISOString()||null,zone.rows[0]?.timezone||'Asia/Kolkata',p.saveDraft?'DRAFT':'SCHEDULED',p.contentOrigin]);
+  for(const account of accounts.rows){
+   const targetId=newId(),type=!asset?'TEXT':asset.mime_type==='video/mp4'?'REEL':'IMAGE';
+   await client.query('insert into post_targets(id,post_id,workspace_id,social_account_id,platform,content_type,caption_override,scheduled_at_utc,publishing_status) values($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+    [targetId,postId,res.locals.workspaceId,account.id,account.platform,type,p.overrides[account.id]||null,(when||new Date()).toISOString(),p.saveDraft?'DRAFT':'SCHEDULED']);
+   if(!p.saveDraft)await client.query('insert into publication_jobs(id,post_target_id,available_at) values($1,$2,$3)',[newId(),targetId,when!.toISOString()]);
   }
-  const scheduled=p.saveDraft?null:p.scheduledAtUtc?new Date(p.scheduledAtUtc):new Date(Date.now()+10000);
-  if(scheduled&&scheduled.getTime()<Date.now()-5000)throw bad('Scheduled time cannot be in the past');
-  if(scheduled&&scheduled.getTime()>Date.now()+365*24*3600000)throw bad('Schedule within the next 365 days');
-  const client=await pool.connect();try{await client.query('begin');
-    const post=await client.query<{id:string}>(`insert into posts(workspace_id,created_by,media_asset_id,caption,scheduled_at_utc,timezone,lifecycle_status,content_origin)
-      values($1,$2,$3,$4,$5,(select timezone from workspaces where id=$1),$6,$7) returning id`,[res.locals.workspaceId,res.locals.userId,p.mediaAssetId??null,p.caption,scheduled?.toISOString()??null,p.saveDraft?'DRAFT':'SCHEDULED',p.contentOrigin]);
-    const postId=post.rows[0]!.id;
-    for(const a of accountRows.rows){
-      const type=!mime?'TEXT':mime==='video/mp4'?'REEL':'IMAGE';
-      const target=await client.query<{id:string}>(`insert into post_targets(post_id,workspace_id,social_account_id,platform,content_type,caption_override,scheduled_at_utc,publishing_status)
-        values($1,$2,$3,$4,$5,$6,$7,$8) returning id`,[postId,res.locals.workspaceId,a.id,a.platform,type,p.overrides[a.id]??null,(scheduled??new Date()).toISOString(),p.saveDraft?'DRAFT':'SCHEDULED']);
-      if(!p.saveDraft)await client.query(`insert into publication_jobs(post_target_id,available_at) values($1,$2)`,[target.rows[0]!.id,scheduled!.toISOString()]);
-    }
-    await client.query('commit');await audit(res.locals.workspaceId,res.locals.userId,'post',postId,p.saveDraft?'DRAFT_CREATED':'SCHEDULED');res.status(201).json({id:postId});
-  }catch(e){await client.query('rollback');throw e;}finally{client.release();}
+  await client.query('commit');
+ }catch(e){await client.query('rollback');throw e;}finally{client.release();}
+ await audit(res.locals.workspaceId,res.locals.userId,'post',postId,p.saveDraft?'DRAFT_CREATED':'SCHEDULED');
+ res.status(201).json({id:postId});
 }));
-
 app.post('/api/posts/:id/activate-draft',auth,member,asyncRoute(async(req,res)=>{
  const when=req.body?.scheduledAtUtc?new Date(req.body.scheduledAtUtc):null;
- const accountIds=Array.isArray(req.body?.accountIds)?req.body.accountIds:[];
+ const accountIds=Array.isArray(req.body?.accountIds)?[...new Set<string>(req.body.accountIds)]:[];
  const caption=String(req.body?.caption??'');
- if(!when||!Number.isFinite(when.getTime())||when.getTime()<Date.now()+5000||when.getTime()>Date.now()+365*86400000)throw bad('Choose a valid future publishing time');
- if(!accountIds.length||accountIds.length>20||accountIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id)))throw bad('Choose one or more authorized accounts');
+ if(!when||!Number.isFinite(when.getTime())||when.getTime()<Date.now()+5000||when.getTime()>Date.now()+365*86400000)throw bad('Choose a future publishing time');
+ if(!accountIds.length||accountIds.length>20||accountIds.some(id=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id)))throw bad('Choose one or more authorized accounts');
  if(caption.length>15000)throw bad('Caption is too long');
- const client=await pool.connect();try{await client.query('begin');
-   const post=await client.query<{id:string;lifecycle_status:string;media_asset_id:string|null}>(`select id,lifecycle_status,media_asset_id from posts where id=$1 and workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
-   if(!post.rows.length||post.rows[0]!.lifecycle_status!=='DRAFT')throw bad('Only drafts can be activated',409);
-   const targetRows=await client.query(`select id from post_targets where post_id=$1 for update`,[req.params.id]);
-   const accounts=await client.query<{id:string;platform:string}>(`select id,platform from social_accounts where id=any($1::uuid[]) and workspace_id=$2 and connection_status='CONNECTED'`,[accountIds,res.locals.workspaceId]);
-   if(accounts.rows.length!==new Set(accountIds).size)throw bad('Some accounts are no longer connected');
-   const media=post.rows[0]!.media_asset_id?await client.query<{mime_type:string;width:number;height:number;duration_seconds:string}>(`select mime_type,width,height,duration_seconds from media_assets where id=$1 and workspace_id=$2`,[post.rows[0]!.media_asset_id,res.locals.workspaceId]):null;
-   const asset=media?.rows[0];
-   for(const a of accounts.rows){
-     if(a.platform==='INSTAGRAM'&&!asset)throw bad('Instagram requires image or Reel media');
-     if(a.platform==='INSTAGRAM'&&asset?.mime_type.startsWith('image/')&&(asset.width/asset.height<0.8||asset.width/asset.height>1.91))throw bad('Instagram image aspect ratio must be 4:5 to 1.91:1');
-     if(a.platform==='FACEBOOK'&&asset?.mime_type==='video/mp4'&&(Number(asset.duration_seconds)>60||Number(asset.duration_seconds)<4||asset.width<540||asset.height<960||Math.abs(asset.width/asset.height-9/16)>0.02))throw bad('Facebook Reel dimensions or duration are unsupported');
-   }
-   await client.query('delete from post_targets where post_id=$1',[req.params.id]);
-   await client.query(`update posts set lifecycle_status='SCHEDULED',caption=$2,scheduled_at_utc=$3,updated_at=UTC_TIMESTAMP(3) where id=$1`,[req.params.id,caption,when.toISOString()]);
-   for(const a of accounts.rows){
-     const type=!asset?'TEXT':asset.mime_type==='video/mp4'?'REEL':'IMAGE';
-     const {rows}=await client.query<{id:string}>(`insert into post_targets(post_id,workspace_id,social_account_id,platform,content_type,scheduled_at_utc,publishing_status)
-       values($1,$2,$3,$4,$5,$6,'SCHEDULED') returning id`,[req.params.id,res.locals.workspaceId,a.id,a.platform,type,when.toISOString()]);
-     await client.query(`insert into publication_jobs(post_target_id,available_at) values($1,$2)`,[rows[0]!.id,when.toISOString()]);
-   }
-   await client.query('commit');await audit(res.locals.workspaceId,res.locals.userId,'post',req.params.id!,'DRAFT_ACTIVATED');res.json({ok:true});
+ const client=await pool.connect();
+ try{await client.query('begin');
+  const {rows}=await client.query<{id:string;media_asset_id:string|null;lifecycle_status:string}>('select id,media_asset_id,lifecycle_status from posts where id=$1 and workspace_id=$2 for update',[req.params.id,res.locals.workspaceId]);
+  if(!rows.length||rows[0]!.lifecycle_status!=='DRAFT')throw bad('Only drafts can be activated',409);
+  const accounts=await client.query<{id:string;platform:'FACEBOOK'|'INSTAGRAM'}>("select id,platform from social_accounts where id IN ($1) and workspace_id=$2 and connection_status='CONNECTED'",[accountIds,res.locals.workspaceId]);
+  if(accounts.rows.length!==accountIds.length)throw bad('Some accounts are no longer connected');
+  const media=rows[0]!.media_asset_id?await client.query<{mime_type:string;width:number;height:number;duration_seconds:number}>('select mime_type,width,height,duration_seconds from media_assets where id=$1 and workspace_id=$2',[rows[0]!.media_asset_id,res.locals.workspaceId]):null;
+  const asset=media?.rows[0];
+  for(const account of accounts.rows){
+   if(account.platform==='INSTAGRAM'&&!asset)throw bad('Instagram requires media');
+   if(account.platform==='INSTAGRAM'&&asset?.mime_type.startsWith('image/')&&(asset.width/asset.height<0.8||asset.width/asset.height>1.91))throw bad('Instagram requires 4:5 to 1.91:1');
+   if(account.platform==='FACEBOOK'&&asset?.mime_type==='video/mp4'&&(Number(asset.duration_seconds)>60||Number(asset.duration_seconds)<4||asset.width<540||asset.height<960||Math.abs(asset.width/asset.height-9/16)>0.02))throw bad('Facebook Reel dimensions or duration unsupported');
+  }
+  await client.query('delete from post_targets where post_id=$1',[req.params.id]);
+  await client.query("update posts set lifecycle_status='SCHEDULED',caption=$2,scheduled_at_utc=$3,updated_at=UTC_TIMESTAMP(3) where id=$1",[req.params.id,caption,when.toISOString()]);
+  for(const account of accounts.rows){
+   const targetId=newId(),type=!asset?'TEXT':asset.mime_type==='video/mp4'?'REEL':'IMAGE';
+   await client.query("insert into post_targets(id,post_id,workspace_id,social_account_id,platform,content_type,scheduled_at_utc,publishing_status) values($1,$2,$3,$4,$5,$6,$7,'SCHEDULED')",[targetId,req.params.id,res.locals.workspaceId,account.id,account.platform,type,when.toISOString()]);
+   await client.query('insert into publication_jobs(id,post_target_id,available_at) values($1,$2,$3)',[newId(),targetId,when.toISOString()]);
+  }
+  await client.query('commit');
  }catch(e){await client.query('rollback');throw e;}finally{client.release();}
+ await audit(res.locals.workspaceId,res.locals.userId,'post',req.params.id!,'DRAFT_ACTIVATED');res.json({ok:true});
 }));
-app.get('/api/posts',auth,member,asyncRoute(async(req,res)=>{
-  const status=req.query.status;
-  const {rows}=await pool.query(`select p.id,p.caption,p.scheduled_at_utc,p.timezone,p.lifecycle_status,p.created_at,p.media_asset_id,
-    coalesce(json_agg(json_build_object('id',t.id,'platform',t.platform,'publishing_status',t.publishing_status,'social_account_id',t.social_account_id,'account_name',a.name,'provider_permalink',t.provider_permalink,'last_error_message',t.last_error_message,'published_at',t.published_at) order by t.created_at) filter(where t.id is not null),'[]'::json) targets
-    from posts p left join post_targets t on t.post_id=p.id left join social_accounts a on a.id=t.social_account_id
-    where p.workspace_id=$1 group by p.id order by coalesce(p.scheduled_at_utc,p.created_at) desc limit 250`,[res.locals.workspaceId]);res.json({posts:rows});
+app.get('/api/posts',auth,member,asyncRoute(async(_req,res)=>{
+ const {rows}=await pool.query<any>(
+  'select id,caption,scheduled_at_utc,timezone,lifecycle_status,created_at,media_asset_id from posts where workspace_id=$1 order by coalesce(scheduled_at_utc,created_at) desc limit 250',[res.locals.workspaceId]);
+ const {rows:targets}=await pool.query<any>(
+  'select t.id,t.post_id,t.platform,t.publishing_status,t.social_account_id,a.name as account_name,t.provider_permalink,t.last_error_message,t.published_at from post_targets t join social_accounts a on a.id=t.social_account_id where t.workspace_id=$1 order by t.created_at',[res.locals.workspaceId]);
+ const byPost=new Map<string,any[]>();for(const target of targets){const x=byPost.get(target.post_id)||[];x.push(target);byPost.set(target.post_id,x);}
+ res.json({posts:rows.map(p=>({...p,targets:byPost.get(p.id)||[]}))});
 }));
 app.patch('/api/posts/:id/reschedule',auth,member,asyncRoute(async(req,res)=>{
   const p=rescheduleSchema.safeParse(req.body);if(!p.success)throw bad('Invalid scheduled UTC datetime');const when=new Date(p.data.scheduledAtUtc);
