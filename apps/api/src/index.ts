@@ -4,7 +4,7 @@ import {fileTypeFromBuffer} from 'file-type';import sharp from 'sharp';
 import {createHash,randomBytes,randomUUID} from 'node:crypto';
 import {createPostSchema,rescheduleSchema} from '@cherrylink/shared';
 import {config,pool,newId,authorize,audit,encrypt,hashState,oauthUrl,exchangeCode,discoverPageAccounts,graphGet,debugToken,
- getSessionUser,createSession,destroySession,verifyPassword,createUser,tokenHash,validateCsrf,csrfToken,
+ getSessionUser,createSession,destroySession,verifyPassword,passwordHash,tokenHash,validateCsrf,csrfToken,
  saveMedia,readMedia,createMediaUrl,verifyMediaUrl,mediaContentType} from '@cherrylink/server';
 
 const app=express();app.disable('x-powered-by');if(config.NODE_ENV==='production')app.set('trust proxy',1);
@@ -60,11 +60,12 @@ app.post('/api/auth/accept-invite',loginLimiter,asyncRoute(async(req,res)=>{
  const invite=rows[0]!;
  const existing=await pool.query('select id from users where email=$1',[invite.email]);
  if(existing.rows.length)throw bad('Account already exists. Sign in to accept the invitation.',409);
- const userId=await createUser(invite.email,password);
+ const userId=newId(),hashed=await passwordHash(password);
  const client=await pool.connect();
  try{await client.query('begin');
   const locked=await client.query('select token_hash from workspace_invitations where token_hash=$1 and accepted_at is null and expires_at>UTC_TIMESTAMP(3) for update',[tokenHash(token)]);
   if(!locked.rows.length)throw bad('Invitation no longer available',410);
+  await client.query('insert into users(id,email,password_hash) values($1,$2,$3)',[userId,invite.email,hashed]);
   await client.query('insert into workspace_members(id,workspace_id,user_id,role) values($1,$2,$3,$4)',[newId(),invite.workspace_id,userId,invite.role]);
   await client.query('update workspace_invitations set accepted_at=UTC_TIMESTAMP(3) where token_hash=$1',[tokenHash(token)]);
   await client.query('commit');
@@ -109,7 +110,9 @@ app.post('/api/accounts/:id/disconnect',auth,member,admin,asyncRoute(async(req,r
 }));
 app.post('/api/connections/:platform/start',auth,member,admin,asyncRoute(async(req,res)=>{
   const kind=req.params.platform==='facebook'?'FACEBOOK':req.params.platform==='instagram'?'INSTAGRAM':null;
-  if(!kind)throw bad('Unsupported platform');const raw=randomBytes(32).toString('base64url');
+  if(!kind)throw bad('Unsupported platform');
+   if(!config.META_APP_ID||!config.META_APP_SECRET||(kind==='FACEBOOK'&&!config.META_FACEBOOK_CONFIG_ID)||(kind==='INSTAGRAM'&&!config.META_INSTAGRAM_CONFIG_ID))throw bad('Meta is not configured yet; add app credentials and login configuration before connecting an account.',503);
+   const raw=randomBytes(32).toString('base64url');
   await pool.query(`insert into oauth_states(state_hash,workspace_id,actor_id,platform,expires_at) values($1,$2,$3,$4,DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE))`,[hashState(raw),res.locals.workspaceId,res.locals.userId,kind]);
   res.json({authorizationUrl:oauthUrl(req.params.platform as 'facebook'|'instagram',raw)});
 }));
