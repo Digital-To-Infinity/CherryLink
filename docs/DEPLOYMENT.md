@@ -1,45 +1,36 @@
-# Deployment runbook (not yet deployed)
+# CherryLink — MySQL deployment runbook
 
-## Topology
+## Deployment topology
 
-- **Frontend:** HTTPS static hosting for `apps/web/dist`. Environment `VITE_API_URL`, `VITE_SUPABASE_URL` and **public** `VITE_SUPABASE_ANON_KEY` are injected at *build* time.
-- **API:** Always-on Node service, public HTTPS reverse proxy, health `/healthz`, readiness `/readyz`, auth and OAuth callbacks.
-- **Worker:** Independent always-on Node service using the same database/storage and encryption key. Private network preferred; no public ingress needed. `LIVE_PUBLISHING_ENABLED=false` until verified.
-- **Database and storage:** new Supabase project, service-role key on server only; use project backups and regional requirements.
+- Frontend: HTTPS static React/Vite app (`VITE_API_URL=https://your-api-domain` at build time).
+- API: Node.js/Express behind HTTPS, cookie sessions, MySQL, Meta OAuth callbacks, signed media endpoint.
+- Worker: dedicated always-on Node service without public ingress; same MySQL and **same private media storage volume** as API.
+- Database: independent MySQL 8 (InnoDB, UTC sessions); do not share a database with the DTI CRM.
+- Media: persistent private filesystem (or later a compatible abstraction). Backup alongside MySQL.
+- TLS: HTTPS at origin is mandatory for production cookie security and Meta media fetching.
 
-## Runtime
+## Setup
 
-1. Install Node 22+, FFmpeg/FFprobe and npm dependencies. Run `npm install`, commit the generated lockfile when creating your own repository, then `npm run build`.
-2. Apply `0001_cherrylink.sql` then `0002_connection_sessions.sql` to a **new isolated project**.
-3. Set env vars in API and worker secret managers. Never set the service key, Graph secret or encryption key in `VITE_` variables.
-4. Deploy API as `node apps/api/dist/index.js` and worker as `node apps/worker/dist/index.js`, with process restarts enabled.
-5. Register exact Meta OAuth callback URLs, test sign-in, upload, account discovery and permissions in development mode. Use a valid HTTPS endpoint for Meta-fetchable media.
-6. Run the acceptance checklist. Only after a real scheduled Facebook + Instagram post succeeds with the browser closed, set worker `LIVE_PUBLISHING_ENABLED=true` for approved accounts.
-7. Monitor worker heartbeat (fresh under 3 minutes), database jobs due vs actual delivery, PUBLISHED/UNKNOWN counts, token health, API request errors, disk/memory and Meta rate-limit responses. Alert an on-call team member on stuck/UNKNOWN jobs.
+1. Install Node 22+, MySQL 8, FFmpeg/FFprobe. Configure an independent MySQL database and least-privileged runtime account. Run schema with a migration account, not the runtime credential.
+2. Execute `mysql/migrations/0001_initial.sql` using the MySQL CLI with trigger DELIMITER blocks. Run `npm run mysql:check`.
+3. Set `MYSQL_*`, `MEDIA_DIR`, `MEDIA_PUBLIC_BASE_URL`, `MEDIA_SIGNING_KEY`, `TOKEN_ENCRYPTION_KEY_BASE64`, `WEB_URL`, `CORS_ORIGIN`, and Meta keys in the secure runtime environment. Never commit `.env`.
+4. Run `npm run build`. Deploy `node apps/api/dist/index.js` and `node apps/worker/dist/index.js` as independent restartable services (systemd, supervised containers, or a VPS process manager).
+5. Keep `LIVE_PUBLISHING_ENABLED=false` until live, authorized end-to-end Meta tests pass.
+6. Verify cookie sessions, admin bootstrap, workspace isolation, media upload/preview, signed HTTPS fetch from an external network, and the Meta OAuth callback URL settings. Prove unattended publishing with the browser closed.
+7. Monitor worker heartbeats, due jobs, statuses (`UNKNOWN` must trigger human review), Meta rate limits, database connection failures and filesystem availability.
 
-## Example Docker targets
+## Media and workers
 
-`Dockerfile` supports `SERVICE=api` or `SERVICE=worker`; this is a starter recipe, not a validated production deployment. Configure persistent secrets, environment-specific limits and restart policies. Web app static deployment may use `Dockerfile.web`.
+Media paths are relative to `MEDIA_DIR`, which must be the same durable path for API and worker. When deploying API and worker to **different hosts**, a shared persistent POSIX-compatible volume or an implemented compatible object-storage adapter is mandatory; local unshared disks will break publishing. `MEDIA_PUBLIC_BASE_URL` must point to the API's publicly reachable HTTPS address, not localhost.
 
-## Worker restart and duplicate safety
+Multiple workers claim due jobs using MySQL `FOR UPDATE SKIP LOCKED`, with a per-account lease row and heartbeat renewal. On crash, expired `RUNNING` jobs are moved to `UNKNOWN` to avoid replaying an ambiguous Meta final publish request. They are not silently retried.
 
-Rows locked during the publish call are released after a crash, and their lease expires. Restarted workers quarantine stale `RUNNING` jobs as `UNKNOWN` instead of automatically repeating the Meta request. A human or a verified provider reconciliation flow must resolve the outcome before a retry. A correct scheduler prefers a visible unresolved delivery to a duplicate live post.
+## Backups / recovery
 
-## Backup/restore drill
+Take encrypted and tested MySQL backups plus private media volume snapshots. Store `TOKEN_ENCRYPTION_KEY_BASE64` in a separate recovery-safe secret manager; without it stored provider tokens cannot be decrypted. On restore use `LIVE_PUBLISHING_ENABLED=false`, reconcile old scheduled jobs before enabling publishing, then restore worker safely.
 
-Take an encrypted PostgreSQL backup; verify at least one restore to a clean test environment. Maintain the private media bucket and token encryption key according to retention policies. Do not restore scheduled jobs into a live worker without a reconciliation/fencing run, as old jobs could republish.
+## Local Docker
 
-## Push to a dedicated GitHub repository
+`compose.mysql.yml` provides development-only MySQL service. `Dockerfile` supports API and worker images; attach the same private media volume to both containers. `Dockerfile.web` builds the frontend without any third-party authentication variables.
 
-The connected `Digital-To-Infinity` organization currently does not expose a CherryLink repository to the development connector. Create a **new private repository** named `CherryLink` in that organization, leaving the existing CRM and website repositories untouched. Then clone/init in this extracted folder and push a reviewed branch:
-
-```bash
-git init
-git switch -c main
-git add .
-git commit -m "Initial CherryLink foundation"
-git remote add origin https://github.com/Digital-To-Infinity/CherryLink.git
-git push -u origin main
-```
-
-Alternatively, create an empty repository in the GitHub UI and share access with the connected GitHub app. Do not commit `.env`, secrets or access tokens. Use protected main and PR branches for subsequent milestones.
+This runbook is not evidence that deployment or live Meta publication has succeeded.
