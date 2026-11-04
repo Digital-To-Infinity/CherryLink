@@ -1,18 +1,17 @@
 import {createHash,randomBytes,scrypt as scryptCallback,timingSafeEqual} from 'node:crypto';
-import {promisify} from 'node:util';
 import {pool,newId} from './db.js';
-const scrypt=promisify(scryptCallback);
+const scrypt=(password:string,salt:string)=>new Promise<Buffer>((resolve,reject)=>scryptCallback(password,salt,64,{N:16384,r:8,p:1},(err,derived)=>err?reject(err):resolve(derived)));
 const hash=(v:string)=>createHash('sha256').update(v).digest('hex');
 export async function passwordHash(password:string){
  if(password.length<12||password.length>128)throw Object.assign(new Error('Password must be 12–128 characters'),{statusCode:400});
  const salt=randomBytes(24).toString('hex');
- const derived=await scrypt(password,salt,64,{N:16384,r:8,p:1}) as Buffer;
+ const derived=await scrypt(password,salt);
  return 'scrypt$'+salt+'$'+derived.toString('hex');
 }
 export async function verifyPassword(password:string,stored:string){
  const [algorithm,salt,key]=stored.split('$');
  if(algorithm!=='scrypt'||!salt||!key)return false;
- const derived=await scrypt(password,salt,64,{N:16384,r:8,p:1}) as Buffer;
+ const derived=await scrypt(password,salt);
  const expected=Buffer.from(key,'hex');return expected.length===derived.length&&timingSafeEqual(derived,expected);
 }
 export async function createSession(userId:string){
