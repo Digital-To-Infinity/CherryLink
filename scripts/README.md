@@ -1,1 +1,1 @@
-Apply `supabase/migrations/0001_cherrylink.sql` in a **new** Supabase project using SQL editor or your migrations pipeline. Storage bucket is private and only server credentials may access it. Do not apply this migration to an existing DTI CRM or production database.
+CherryLink is MySQL-only. Import `mysql/migrations/0001_initial.sql` into a new MySQL 8 database. Run `npm run mysql:check` and `npm run admin:create` with temporary `CHERRYLINK_ADMIN_EMAIL` and `CHERRYLINK_ADMIN_PASSWORD`. Credentials stay out of Git.

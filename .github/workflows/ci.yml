@@ -1,8 +1,35 @@
-name: Typecheck and Unit Tests
+name: Build and MySQL Integration Tests
 on: [push, pull_request]
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci_test_root_only
+          MYSQL_DATABASE: cherrylink
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_test_root_only"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=15
+    env:
+      CI_MYSQL_TEST: 'true'
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: '3306'
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ci_test_root_only
+      MYSQL_DATABASE: cherrylink
+      MYSQL_SSL: 'false'
+      TOKEN_ENCRYPTION_KEY_BASE64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+      MEDIA_SIGNING_KEY: 'ci-test-signing-key-only-not-a-production-secret-1234'
+      WEB_URL: http://127.0.0.1:5173
+      CORS_ORIGIN: http://127.0.0.1:5173
+      MEDIA_PUBLIC_BASE_URL: http://127.0.0.1:3001
+      LIVE_PUBLISHING_ENABLED: 'false'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -10,4 +37,9 @@ jobs:
           node-version: '22'
       - run: npm install --no-audit --no-fund
       - run: npm run build
+      - name: Install MySQL client
+        run: sudo apt-get update -qq && sudo apt-get install -y default-mysql-client
+      - name: Apply MySQL 8 schema with triggers
+        run: mysql -h 127.0.0.1 -uroot -pci_test_root_only cherrylink < mysql/migrations/0001_initial.sql
+      - run: npm run mysql:check
       - run: npm test
