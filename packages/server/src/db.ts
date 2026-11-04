@@ -11,9 +11,11 @@ function bindings(sql:string,args:unknown[]=[]):[string,unknown[]]{
  const bound:unknown[]=[];
  const statement=sql.replace(/\$(\d+)/g,(_,n:string)=>{
   const i=Number(n)-1;if(i<0||i>=args.length)throw Error('Missing SQL parameter');
-  const value=args[i];
+
   // MySQL DATETIME columns store UTC without timezone suffix. Normalize ISO instants.
-  bound.push(typeof value==='string' && /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$/.test(value)?value.replace('T',' ').replace(/Z$/,''):value);
+  const value=args[i];
+  const dateMatch=typeof value==='string' && value.match(new RegExp('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?Z$'));
+  bound.push(dateMatch?(value as string).replace('T',' ').slice(0,-1):value);
   return '?';
  });
  return [statement,bound];
