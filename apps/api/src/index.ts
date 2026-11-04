@@ -315,46 +315,46 @@ app.patch('/api/posts/:id/reschedule',auth,member,asyncRoute(async(req,res)=>{
   const p=rescheduleSchema.safeParse(req.body);if(!p.success)throw bad('Invalid scheduled UTC datetime');const when=new Date(p.data.scheduledAtUtc);
   if(when.getTime()<Date.now()+5000)throw bad('Choose a time at least 5 seconds in the future');
   const client=await pool.connect();try{await client.query('begin');
-    const targets=await client.query<{id:string;publishing_status:string}>(`select t.id,t.publishing_status from post_targets t join posts p on p.id=t.post_id where p.id=$1 and p.workspace_id=$2 for update of t`,[req.params.id,res.locals.workspaceId]);
+    const targets=await client.query<{id:string;publishing_status:string}>(`select t.id,t.publishing_status from post_targets t join posts p on p.id=t.post_id where p.id=$1 and p.workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
     if(!targets.rows.length||targets.rows.some(t=>!['SCHEDULED','RETRY_WAIT','READY'].includes(t.publishing_status)))throw bad('Cannot reschedule a started, published, cancelled or uncertain delivery',409);
     await client.query(`update posts set scheduled_at_utc=$1,lifecycle_status='SCHEDULED',updated_at=UTC_TIMESTAMP(3) where id=$2`,[when.toISOString(),req.params.id]);
     await client.query(`update post_targets set scheduled_at_utc=$1,publishing_status='SCHEDULED',updated_at=UTC_TIMESTAMP(3) where post_id=$2`,[when.toISOString(),req.params.id]);
-    await client.query(`update publication_jobs set available_at=$1,status='QUEUED',locked_until=null,worker_id=null,updated_at=UTC_TIMESTAMP(3) where post_target_id=any($2::uuid[])`,[when.toISOString(),targets.rows.map(t=>t.id)]);
+    await client.query(`update publication_jobs set available_at=$1,status='QUEUED',locked_until=null,worker_id=null,updated_at=UTC_TIMESTAMP(3) where post_target_id IN ($2)`,[when.toISOString(),targets.rows.map(t=>t.id)]);
     await client.query('commit');await audit(res.locals.workspaceId,res.locals.userId,'post',req.params.id!,'RESCHEDULE');res.json({ok:true});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }));
 app.post('/api/posts/:id/cancel',auth,member,asyncRoute(async(req,res)=>{
   const client=await pool.connect();try{await client.query('begin');
-    const targets=await client.query<{id:string;publishing_status:string}>(`select t.id,t.publishing_status from post_targets t join posts p on p.id=t.post_id where p.id=$1 and p.workspace_id=$2 for update of t`,[req.params.id,res.locals.workspaceId]);
+    const targets=await client.query<{id:string;publishing_status:string}>(`select t.id,t.publishing_status from post_targets t join posts p on p.id=t.post_id where p.id=$1 and p.workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
     const post=await client.query<{lifecycle_status:string}>(`select lifecycle_status from posts where id=$1 and workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
     if(!post.rows.length)throw bad('Post not found',404);
     if(targets.rows.some(t=>['PREPARING','PUBLISHING','UNKNOWN'].includes(t.publishing_status)))throw bad('An in-flight or unknown delivery cannot be safely cancelled',409);
     const remaining=targets.rows.filter(t=>!['PUBLISHED','CANCELLED'].includes(t.publishing_status)).map(t=>t.id);
-    if(remaining.length){await client.query(`update post_targets set publishing_status='CANCELLED',updated_at=UTC_TIMESTAMP(3) where id=any($1::uuid[])`,[remaining]);await client.query(`update publication_jobs set status='CANCELLED',updated_at=UTC_TIMESTAMP(3) where post_target_id=any($1::uuid[])`,[remaining]);}
+    if(remaining.length){await client.query(`update post_targets set publishing_status='CANCELLED',updated_at=UTC_TIMESTAMP(3) where id IN ($1)`,[remaining]);await client.query(`update publication_jobs set status='CANCELLED',updated_at=UTC_TIMESTAMP(3) where post_target_id IN ($1)`,[remaining]);}
     await client.query(`update posts set lifecycle_status=$1,updated_at=UTC_TIMESTAMP(3) where id=$2`,[targets.rows.some(t=>t.publishing_status==='PUBLISHED')?'PARTIALLY_PUBLISHED':'CANCELLED',req.params.id]);await client.query('commit');
     await audit(res.locals.workspaceId,res.locals.userId,'post',req.params.id!,'CANCEL');res.json({ok:true});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }));
 app.post('/api/targets/:id/retry',auth,member,admin,asyncRoute(async(req,res)=>{
   const client=await pool.connect();try{await client.query('begin');
-    const {rows}=await client.query<{id:string;publishing_status:string;connection_status:string}>(`select t.id,t.publishing_status,a.connection_status from post_targets t join social_accounts a on a.id=t.social_account_id where t.id=$1 and t.workspace_id=$2 for update of t`,[req.params.id,res.locals.workspaceId]);
+    const {rows}=await client.query<{id:string;publishing_status:string;connection_status:string}>(`select t.id,t.publishing_status,a.connection_status from post_targets t join social_accounts a on a.id=t.social_account_id where t.id=$1 and t.workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
     if(!rows.length||!['FAILED','ACTION_REQUIRED'].includes(rows[0]!.publishing_status)||rows[0]!.connection_status!=='CONNECTED')throw bad('Retry requires a confirmed failed delivery and a connected account',409);
     await client.query(`update post_targets set publishing_status='SCHEDULED',last_error_code=null,last_error_message=null,updated_at=UTC_TIMESTAMP(3) where id=$1`,[req.params.id]);
-    await client.query(`insert into publication_jobs(post_target_id,available_at,status) values($1,now(),'QUEUED') on conflict(post_target_id) do update set available_at=now(),status='QUEUED',worker_id=null,locked_until=null`,[req.params.id]);
+    await client.query(`insert into publication_jobs(id,post_target_id,available_at,status) values($2,$1,UTC_TIMESTAMP(3),'QUEUED') on duplicate key update available_at=UTC_TIMESTAMP(3),status='QUEUED',worker_id=null,locked_until=null`,[req.params.id,newId()]);
     await client.query('commit');await audit(res.locals.workspaceId,res.locals.userId,'post_target',req.params.id!,'RETRY_REQUESTED');res.json({ok:true});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }));
 app.get('/api/team',auth,member,asyncRoute(async(_req,res)=>{const {rows}=await pool.query('select user_id,role,created_at from workspace_members where workspace_id=$1 order by created_at',[res.locals.workspaceId]);res.json({members:rows});}));
 app.get('/api/operations',auth,member,admin,asyncRoute(async(_req,res)=>{
-  const jobs=await pool.query(`select j.status,count(*)::int as count from publication_jobs j join post_targets t on t.id=j.post_target_id where t.workspace_id=$1 group by j.status`,[res.locals.workspaceId]);
-  const workers=await pool.query(`select worker_id,last_seen_at,status from worker_heartbeats where last_seen_at>now()-interval '3 minutes'`);
+  const jobs=await pool.query(`select j.status,CAST(count(*) AS UNSIGNED) as count from publication_jobs j join post_targets t on t.id=j.post_target_id where t.workspace_id=$1 group by j.status`,[res.locals.workspaceId]);
+  const workers=await pool.query(`select worker_id,last_seen_at,status from worker_heartbeats where last_seen_at>DATE_SUB(UTC_TIMESTAMP(3),INTERVAL 3 MINUTE)`);
   res.json({jobs:jobs.rows,workers:workers.rows,livePublishingEnabled:config.LIVE_PUBLISHING_ENABLED==='true'});
 }));
 
 app.patch('/api/posts/:id/edit',auth,member,asyncRoute(async(req,res)=>{
   const caption=req.body?.caption;if(typeof caption!=='string'||caption.length>15000)throw bad('Caption must be 15,000 characters or less');
   const client=await pool.connect();try{await client.query('begin');
-    const {rows}=await client.query<{publishing_status:string}>(`select t.publishing_status from post_targets t join posts p on p.id=t.post_id where p.id=$1 and p.workspace_id=$2 for update of t`,[req.params.id,res.locals.workspaceId]);
+    const {rows}=await client.query<{publishing_status:string}>(`select t.publishing_status from post_targets t join posts p on p.id=t.post_id where p.id=$1 and p.workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
     const exists=await client.query(`select id from posts where id=$1 and workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
     if(!exists.rows.length)throw bad('Post not found',404);
     if(rows.some(t=>!['DRAFT','SCHEDULED','RETRY_WAIT','READY'].includes(t.publishing_status)))throw bad('Cannot edit a started or finished publication',409);
@@ -367,13 +367,15 @@ app.get('/api/targets/:id/attempts',auth,member,asyncRoute(async(req,res)=>{
     from publication_attempts at join post_targets t on t.id=at.post_target_id where t.id=$1 and t.workspace_id=$2 order by at.attempt_number desc`,[req.params.id,res.locals.workspaceId]);res.json({attempts:rows});
 }));
 app.post('/api/team/invite',auth,member,admin,asyncRoute(async(req,res)=>{
-  const email=String(req.body?.email||'').trim().toLowerCase();const role=req.body?.role;
-  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!['ADMIN','EDITOR'].includes(role))throw bad('Valid email and role required');
-  // Supabase Auth invitations issue an email; do not return or log invite links.
-  const {data,error}=await supabaseAdmin.auth.admin.inviteUserByEmail(email,{redirectTo:config.WEB_URL});
-  if(error||!data.user)throw bad('Invite could not be issued. For existing members, add them by User ID.',409);
-  await pool.query(`insert into workspace_members(workspace_id,user_id,role) values($1,$2,$3) on conflict(workspace_id,user_id) do nothing`,[res.locals.workspaceId,data.user.id,role]);
-  await audit(res.locals.workspaceId,res.locals.userId,'workspace_member',data.user.id,'INVITED',{role});res.status(201).json({ok:true});
+ const email=String(req.body?.email||'').trim().toLowerCase(),role=req.body?.role;
+ if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!['ADMIN','EDITOR'].includes(role))throw bad('Valid email and role required');
+ const token=randomBytes(32).toString('base64url');
+ await pool.query('insert into workspace_invitations(token_hash,workspace_id,invited_by,email,role,expires_at) values($1,$2,$3,$4,$5,DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 7 DAY))',
+  [tokenHash(token),res.locals.workspaceId,res.locals.userId,email,role]);
+ const url=new URL(config.WEB_URL);url.searchParams.set('invite',token);
+ await audit(res.locals.workspaceId,res.locals.userId,'workspace_invitation',email,'INVITED',{role});
+ // No outbound mail service configured: return a one-time invitation URL to the ADMIN only.
+ res.status(201).json({ok:true,inviteUrl:url.toString()});
 }));
 app.patch('/api/settings',auth,member,admin,asyncRoute(async(req,res)=>{
   const timezone=String(req.body?.timezone||'');
