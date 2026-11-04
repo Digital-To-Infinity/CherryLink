@@ -89,36 +89,44 @@ app.get('/readyz',asyncRoute(async(_req,res)=>{await pool.query('select 1');res.
 app.get('/api/me',auth,asyncRoute(async(_req,res)=>{const {rows}=await pool.query(`select w.id,w.name,w.timezone,m.role from workspace_members m join workspaces w on w.id=m.workspace_id where m.user_id=$1 order by w.created_at`,[res.locals.userId]);res.json({workspaces:rows});}));
 app.post('/api/workspaces',auth,asyncRoute(async(req,res)=>{
   const name=String(req.body?.name??'').trim();if(name.length<2||name.length>120)throw bad('Workspace name must have 2-120 characters');
-  const client=await pool.connect();try{await client.query('begin');const {rows}=await client.query<{id:string}>('insert into workspaces(name) values($1) returning id',[name]);
-  await client.query(`insert into workspace_members(workspace_id,user_id,role) values($1,$2,'ADMIN')`,[rows[0]!.id,res.locals.userId]);await client.query('commit');res.status(201).json({id:rows[0]!.id});
+  const client=await pool.connect();try{await client.query('begin');const id=newId();await client.query('insert into workspaces(id,name,settings) values($1,$2,$3)',[id,name,'{}']);
+  await client.query(`insert into workspace_members(id,workspace_id,user_id,role) values($1,$2,$3,'ADMIN')`,[newId(),id,res.locals.userId]);await client.query('commit');res.status(201).json({id});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }));
 app.get('/api/accounts',auth,member,asyncRoute(async(_req,res)=>{
   const {rows}=await pool.query('select id,platform,provider_account_id,name,username,account_type,connection_status,permission_metadata,token_expiry,created_at from social_accounts where workspace_id=$1 order by created_at desc',[res.locals.workspaceId]);res.json({accounts:rows});
 }));
 app.post('/api/accounts/:id/disconnect',auth,member,admin,asyncRoute(async(req,res)=>{
-  const {rows}=await pool.query(`update social_accounts set connection_status='DISCONNECTED',token_reference=null,updated_at=now() where id=$1 and workspace_id=$2 returning id`,[req.params.id,res.locals.workspaceId]);
-  if(!rows.length)throw bad('Account not found',404);
-  await pool.query('delete from social_account_credentials where social_account_id=$1',[req.params.id]);
-  await pool.query(`update post_targets set publishing_status='ACTION_REQUIRED',last_error_code='ACCOUNT_DISCONNECTED' where social_account_id=$1 and publishing_status in ('SCHEDULED','RETRY_WAIT','READY')`,[req.params.id]);
-  await audit(res.locals.workspaceId,res.locals.userId,'social_account',req.params.id!,'DISCONNECT');res.json({ok:true});
+ const existing=await pool.query('select id from social_accounts where id=$1 and workspace_id=$2',[req.params.id,res.locals.workspaceId]);
+ if(!existing.rows.length)throw bad('Account not found',404);
+ const client=await pool.connect();try{await client.query('begin');
+ await client.query("update social_accounts set connection_status='DISCONNECTED',token_reference=null,updated_at=UTC_TIMESTAMP(3) where id=$1",[req.params.id]);
+ await client.query('delete from social_account_credentials where social_account_id=$1',[req.params.id]);
+ await client.query("update post_targets set publishing_status='ACTION_REQUIRED',last_error_code='ACCOUNT_DISCONNECTED' where social_account_id=$1 and publishing_status in ('SCHEDULED','RETRY_WAIT','READY')",[req.params.id]);
+ await client.query('commit');
+ }catch(e){await client.query('rollback');throw e;}finally{client.release();}
+ await audit(res.locals.workspaceId,res.locals.userId,'social_account',req.params.id!,'DISCONNECT');res.json({ok:true});
 }));
-
 app.post('/api/connections/:platform/start',auth,member,admin,asyncRoute(async(req,res)=>{
   const kind=req.params.platform==='facebook'?'FACEBOOK':req.params.platform==='instagram'?'INSTAGRAM':null;
   if(!kind)throw bad('Unsupported platform');const raw=randomBytes(32).toString('base64url');
-  await pool.query(`insert into oauth_states(state_hash,workspace_id,actor_id,platform,expires_at) values($1,$2,$3,$4,now()+interval '10 minutes')`,[hashState(raw),res.locals.workspaceId,res.locals.userId,kind]);
+  await pool.query(`insert into oauth_states(state_hash,workspace_id,actor_id,platform,expires_at) values($1,$2,$3,$4,DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE))`,[hashState(raw),res.locals.workspaceId,res.locals.userId,kind]);
   res.json({authorizationUrl:oauthUrl(req.params.platform as 'facebook'|'instagram',raw)});
 }));
 async function upsertAccount(workspaceId:string,platform:'FACEBOOK'|'INSTAGRAM',providerId:string,name:string,token:string,tokenKind:string,metadata:object){
-  const client=await pool.connect();try{await client.query('begin');
-    const {rows}=await client.query<{id:string}>(`insert into social_accounts(workspace_id,platform,provider_account_id,name,permission_metadata) values($1,$2,$3,$4,$5)
-      on conflict(workspace_id,platform,provider_account_id) do update set name=excluded.name,permission_metadata=excluded.permission_metadata,connection_status='CONNECTED',updated_at=now() returning id`,[workspaceId,platform,providerId,name,JSON.stringify(metadata)]);
-    const id=rows[0]!.id;
-    const secret=await client.query<{id:string}>(`insert into social_account_credentials(social_account_id,encrypted_token,token_kind) values($1,$2,$3)
-      on conflict(social_account_id) do update set encrypted_token=excluded.encrypted_token,token_kind=excluded.token_kind,rotated_at=now() returning id`,[id,encrypt(token),tokenKind]);
-    await client.query('update social_accounts set token_reference=$1 where id=$2',[secret.rows[0]!.id,id]);await client.query('commit');return id;
-  }catch(e){await client.query('rollback');throw e;}finally{client.release();}
+ const client=await pool.connect();
+ try{await client.query('begin');
+  const existing=await client.query<{id:string}>('select id from social_accounts where workspace_id=$1 and platform=$2 and provider_account_id=$3 for update',[workspaceId,platform,providerId]);
+  const id=existing.rows[0]?.id||newId();
+  if(existing.rows.length)await client.query("update social_accounts set name=$1,permission_metadata=$2,connection_status='CONNECTED',updated_at=UTC_TIMESTAMP(3) where id=$3",[name,JSON.stringify(metadata),id]);
+  else await client.query('insert into social_accounts(id,workspace_id,platform,provider_account_id,name,permission_metadata) values($1,$2,$3,$4,$5,$6)',[id,workspaceId,platform,providerId,name,JSON.stringify(metadata)]);
+  const old=await client.query<{id:string}>('select id from social_account_credentials where social_account_id=$1 for update',[id]);
+  const credentialId=old.rows[0]?.id||newId();
+  if(old.rows.length)await client.query('update social_account_credentials set encrypted_token=$1,token_kind=$2,rotated_at=UTC_TIMESTAMP(3) where id=$3',[encrypt(token),tokenKind,credentialId]);
+  else await client.query('insert into social_account_credentials(id,social_account_id,encrypted_token,token_kind) values($1,$2,$3,$4)',[credentialId,id,encrypt(token),tokenKind]);
+  await client.query('update social_accounts set token_reference=$1 where id=$2',[credentialId,id]);
+  await client.query('commit');return id;
+ }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }
 app.get('/api/connections/:platform/callback',asyncRoute(async(req,res)=>{
   const platform=req.params.platform==='facebook'?'FACEBOOK':req.params.platform==='instagram'?'INSTAGRAM':null;
@@ -129,7 +137,7 @@ app.get('/api/connections/:platform/callback',asyncRoute(async(req,res)=>{
   const client=await pool.connect();let session:{workspace_id:string;actor_id:string}|undefined;
   try{await client.query('begin');const {rows}=await client.query<{workspace_id:string;actor_id:string}>(`select workspace_id,actor_id from oauth_states where state_hash=$1 and platform=$2 and consumed_at is null and expires_at>now() for update`,[stateHash,platform]);
     session=rows[0];if(!session)throw bad('Expired or already-used OAuth state',403);
-    await client.query('update oauth_states set consumed_at=now() where state_hash=$1',[stateHash]);await client.query('commit');
+    await client.query('update oauth_states set consumed_at=UTC_TIMESTAMP(3) where state_hash=$1',[stateHash]);await client.query('commit');
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
   if(req.query.error||typeof req.query.code!=='string'){errorLocation.searchParams.set('connect_error','Meta authorization declined or invalid');return res.redirect(errorLocation.toString());}
   const redirectUri=platform==='FACEBOOK'?config.META_FACEBOOK_REDIRECT_URI:config.META_INSTAGRAM_REDIRECT_URI;
@@ -154,8 +162,8 @@ app.get('/api/connections/:platform/callback',asyncRoute(async(req,res)=>{
         }catch{/* Do not mark unverified assets connected. */}
       }
       if(!added){
-        const saved=await pool.query<{id:string}>(`insert into connection_sessions(workspace_id,actor_id,platform,encrypted_token,token_kind,permission_metadata) values($1,$2,'INSTAGRAM',$3,'BUSINESS_INTEGRATION',$4) returning id`,[session!.workspace_id,session!.actor_id,encrypt(token),JSON.stringify({grants})]);
-        errorLocation.searchParams.set('pending_ig_session',saved.rows[0]!.id);
+        const pendingId=newId();await pool.query(`insert into connection_sessions(id,workspace_id,actor_id,platform,encrypted_token,token_kind,permission_metadata,expires_at) values($1,$2,$3,'INSTAGRAM',$4,'BUSINESS_INTEGRATION',$5,DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 15 MINUTE))`,[pendingId,session!.workspace_id,session!.actor_id,encrypt(token),JSON.stringify({grants})]);
+        errorLocation.searchParams.set('pending_ig_session',pendingId);
         return res.redirect(errorLocation.toString());
       }
     }
@@ -173,7 +181,7 @@ app.post('/api/connections/instagram/verify-asset',auth,member,admin,asyncRoute(
   const ig=await graphGet('/'+instagramAccountId,token,{fields:'id,username,account_type'});
   if(String(ig.id)!==String(instagramAccountId)||!ig.username||!['BUSINESS','MEDIA_CREATOR','CREATOR'].includes(String(ig.account_type).toUpperCase()))throw bad('Meta did not verify this professional Instagram account');
   const id=await upsertAccount(res.locals.workspaceId,'INSTAGRAM',instagramAccountId,ig.username,token,'BUSINESS_INTEGRATION',{...rows[0]!.permission_metadata,verifiedVia:'direct_asset'});
-  await pool.query('update connection_sessions set consumed_at=now() where id=$1',[sessionId]);await audit(res.locals.workspaceId,res.locals.userId,'social_account',id,'CONNECTED');res.json({id});
+  await pool.query('update connection_sessions set consumed_at=UTC_TIMESTAMP(3) where id=$1',[sessionId]);await audit(res.locals.workspaceId,res.locals.userId,'social_account',id,'CONNECTED');res.json({id});
 }));
 
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:150*1024*1024,files:1}});
@@ -270,7 +278,7 @@ app.post('/api/posts/:id/activate-draft',auth,member,asyncRoute(async(req,res)=>
      if(a.platform==='FACEBOOK'&&asset?.mime_type==='video/mp4'&&(Number(asset.duration_seconds)>60||Number(asset.duration_seconds)<4||asset.width<540||asset.height<960||Math.abs(asset.width/asset.height-9/16)>0.02))throw bad('Facebook Reel dimensions or duration are unsupported');
    }
    await client.query('delete from post_targets where post_id=$1',[req.params.id]);
-   await client.query(`update posts set lifecycle_status='SCHEDULED',caption=$2,scheduled_at_utc=$3,updated_at=now() where id=$1`,[req.params.id,caption,when.toISOString()]);
+   await client.query(`update posts set lifecycle_status='SCHEDULED',caption=$2,scheduled_at_utc=$3,updated_at=UTC_TIMESTAMP(3) where id=$1`,[req.params.id,caption,when.toISOString()]);
    for(const a of accounts.rows){
      const type=!asset?'TEXT':asset.mime_type==='video/mp4'?'REEL':'IMAGE';
      const {rows}=await client.query<{id:string}>(`insert into post_targets(post_id,workspace_id,social_account_id,platform,content_type,scheduled_at_utc,publishing_status)
@@ -293,9 +301,9 @@ app.patch('/api/posts/:id/reschedule',auth,member,asyncRoute(async(req,res)=>{
   const client=await pool.connect();try{await client.query('begin');
     const targets=await client.query<{id:string;publishing_status:string}>(`select t.id,t.publishing_status from post_targets t join posts p on p.id=t.post_id where p.id=$1 and p.workspace_id=$2 for update of t`,[req.params.id,res.locals.workspaceId]);
     if(!targets.rows.length||targets.rows.some(t=>!['SCHEDULED','RETRY_WAIT','READY'].includes(t.publishing_status)))throw bad('Cannot reschedule a started, published, cancelled or uncertain delivery',409);
-    await client.query(`update posts set scheduled_at_utc=$1,lifecycle_status='SCHEDULED',updated_at=now() where id=$2`,[when.toISOString(),req.params.id]);
-    await client.query(`update post_targets set scheduled_at_utc=$1,publishing_status='SCHEDULED',updated_at=now() where post_id=$2`,[when.toISOString(),req.params.id]);
-    await client.query(`update publication_jobs set available_at=$1,status='QUEUED',locked_until=null,worker_id=null,updated_at=now() where post_target_id=any($2::uuid[])`,[when.toISOString(),targets.rows.map(t=>t.id)]);
+    await client.query(`update posts set scheduled_at_utc=$1,lifecycle_status='SCHEDULED',updated_at=UTC_TIMESTAMP(3) where id=$2`,[when.toISOString(),req.params.id]);
+    await client.query(`update post_targets set scheduled_at_utc=$1,publishing_status='SCHEDULED',updated_at=UTC_TIMESTAMP(3) where post_id=$2`,[when.toISOString(),req.params.id]);
+    await client.query(`update publication_jobs set available_at=$1,status='QUEUED',locked_until=null,worker_id=null,updated_at=UTC_TIMESTAMP(3) where post_target_id=any($2::uuid[])`,[when.toISOString(),targets.rows.map(t=>t.id)]);
     await client.query('commit');await audit(res.locals.workspaceId,res.locals.userId,'post',req.params.id!,'RESCHEDULE');res.json({ok:true});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }));
@@ -306,8 +314,8 @@ app.post('/api/posts/:id/cancel',auth,member,asyncRoute(async(req,res)=>{
     if(!post.rows.length)throw bad('Post not found',404);
     if(targets.rows.some(t=>['PREPARING','PUBLISHING','UNKNOWN'].includes(t.publishing_status)))throw bad('An in-flight or unknown delivery cannot be safely cancelled',409);
     const remaining=targets.rows.filter(t=>!['PUBLISHED','CANCELLED'].includes(t.publishing_status)).map(t=>t.id);
-    if(remaining.length){await client.query(`update post_targets set publishing_status='CANCELLED',updated_at=now() where id=any($1::uuid[])`,[remaining]);await client.query(`update publication_jobs set status='CANCELLED',updated_at=now() where post_target_id=any($1::uuid[])`,[remaining]);}
-    await client.query(`update posts set lifecycle_status=$1,updated_at=now() where id=$2`,[targets.rows.some(t=>t.publishing_status==='PUBLISHED')?'PARTIALLY_PUBLISHED':'CANCELLED',req.params.id]);await client.query('commit');
+    if(remaining.length){await client.query(`update post_targets set publishing_status='CANCELLED',updated_at=UTC_TIMESTAMP(3) where id=any($1::uuid[])`,[remaining]);await client.query(`update publication_jobs set status='CANCELLED',updated_at=UTC_TIMESTAMP(3) where post_target_id=any($1::uuid[])`,[remaining]);}
+    await client.query(`update posts set lifecycle_status=$1,updated_at=UTC_TIMESTAMP(3) where id=$2`,[targets.rows.some(t=>t.publishing_status==='PUBLISHED')?'PARTIALLY_PUBLISHED':'CANCELLED',req.params.id]);await client.query('commit');
     await audit(res.locals.workspaceId,res.locals.userId,'post',req.params.id!,'CANCEL');res.json({ok:true});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }));
@@ -315,7 +323,7 @@ app.post('/api/targets/:id/retry',auth,member,admin,asyncRoute(async(req,res)=>{
   const client=await pool.connect();try{await client.query('begin');
     const {rows}=await client.query<{id:string;publishing_status:string;connection_status:string}>(`select t.id,t.publishing_status,a.connection_status from post_targets t join social_accounts a on a.id=t.social_account_id where t.id=$1 and t.workspace_id=$2 for update of t`,[req.params.id,res.locals.workspaceId]);
     if(!rows.length||!['FAILED','ACTION_REQUIRED'].includes(rows[0]!.publishing_status)||rows[0]!.connection_status!=='CONNECTED')throw bad('Retry requires a confirmed failed delivery and a connected account',409);
-    await client.query(`update post_targets set publishing_status='SCHEDULED',last_error_code=null,last_error_message=null,updated_at=now() where id=$1`,[req.params.id]);
+    await client.query(`update post_targets set publishing_status='SCHEDULED',last_error_code=null,last_error_message=null,updated_at=UTC_TIMESTAMP(3) where id=$1`,[req.params.id]);
     await client.query(`insert into publication_jobs(post_target_id,available_at,status) values($1,now(),'QUEUED') on conflict(post_target_id) do update set available_at=now(),status='QUEUED',worker_id=null,locked_until=null`,[req.params.id]);
     await client.query('commit');await audit(res.locals.workspaceId,res.locals.userId,'post_target',req.params.id!,'RETRY_REQUESTED');res.json({ok:true});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
@@ -334,7 +342,7 @@ app.patch('/api/posts/:id/edit',auth,member,asyncRoute(async(req,res)=>{
     const exists=await client.query(`select id from posts where id=$1 and workspace_id=$2 for update`,[req.params.id,res.locals.workspaceId]);
     if(!exists.rows.length)throw bad('Post not found',404);
     if(rows.some(t=>!['DRAFT','SCHEDULED','RETRY_WAIT','READY'].includes(t.publishing_status)))throw bad('Cannot edit a started or finished publication',409);
-    await client.query('update posts set caption=$2,updated_at=now() where id=$1',[req.params.id,caption]);await client.query('commit');
+    await client.query('update posts set caption=$2,updated_at=UTC_TIMESTAMP(3) where id=$1',[req.params.id,caption]);await client.query('commit');
     await audit(res.locals.workspaceId,res.locals.userId,'post',req.params.id!,'EDIT_CAPTION');res.json({ok:true});
   }catch(e){await client.query('rollback');throw e;}finally{client.release();}
 }));
