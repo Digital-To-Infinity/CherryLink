@@ -1,12 +1,27 @@
-import {createClient} from '@supabase/supabase-js';
 import {formatInTimeZone,fromZonedTime} from 'date-fns-tz';
-export const supabase=createClient(import.meta.env.VITE_SUPABASE_URL||'https://placeholder.supabase.co',import.meta.env.VITE_SUPABASE_ANON_KEY||'placeholder');
-export const API_URL=import.meta.env.VITE_API_URL||'http://localhost:3001';
+export const API_URL=import.meta.env.VITE_API_URL||'http://127.0.0.1:3001';
+let csrf='';
+async function request(path:string,options:RequestInit={}):Promise<any>{
+ const response=await fetch(API_URL+path,{...options,credentials:'include',headers:{...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...options.headers}});
+ const body=await response.json().catch(()=>null);
+ if(!response.ok)throw Error(body?.error?.message||('Request failed ('+response.status+')'));
+ return body;
+}
+export const authClient={
+ async session(){
+  try{const result=await request('/api/auth/session');csrf=result.csrfToken||'';return result.user;}
+  catch{csrf='';return null;}
+ },
+ async login(email:string,password:string){const result=await request('/api/auth/login',{method:'POST',body:JSON.stringify({email,password})});csrf=result.csrfToken;return result;},
+ async acceptInvite(token:string,password:string){const result=await request('/api/auth/accept-invite',{method:'POST',body:JSON.stringify({token,password})});csrf=result.csrfToken;return result;},
+ async joinWorkspace(token:string){return api('/api/auth/join-workspace',null,{method:'POST',body:JSON.stringify({token})});},
+ async logout(){try{await api('/api/auth/logout',null,{method:'POST'});}finally{csrf='';}}
+};
 export async function api(path:string,workspaceId:string|null=null,options:RequestInit={}):Promise<any>{
-  const {data}=await supabase.auth.getSession();const token=data.session?.access_token;
-  if(!token)throw Error('Please sign in again');
-  const response=await fetch(API_URL+path,{...options,headers:{Authorization:`Bearer ${token}`,...(workspaceId?{'x-workspace-id':workspaceId}:{}),...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...options.headers}});
-  const json=await response.json().catch(()=>null);if(!response.ok)throw Error(json?.error?.message||`Request failed (${response.status})`);return json;
+ if(!csrf)await authClient.session();
+ if(!csrf)throw Error('Sign in required');
+ const headers:Record<string,string>={...(workspaceId?{'x-workspace-id':workspaceId}:{}),...((options.method&&options.method!=='GET')?{'x-csrf-token':csrf}:{}),...(options.headers as Record<string,string>||{})};
+ return request(path,{...options,headers});
 }
 export function utcFromLocal(input:string,zone:string){
   const date=fromZonedTime(input,zone);if(!Number.isFinite(date.getTime()))throw Error('Invalid date or time');
