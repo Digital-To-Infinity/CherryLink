@@ -3,24 +3,87 @@ import cors from 'cors';import helmet from 'helmet';import rateLimit from 'expre
 import {fileTypeFromBuffer} from 'file-type';import sharp from 'sharp';
 import {createHash,randomBytes,randomUUID} from 'node:crypto';
 import {createPostSchema,rescheduleSchema} from '@cherrylink/shared';
-import {config,pool,supabaseAdmin,authorize,audit,encrypt,hashState,oauthUrl,exchangeCode,discoverPageAccounts,graphGet,debugToken} from '@cherrylink/server';
+import {config,pool,newId,authorize,audit,encrypt,hashState,oauthUrl,exchangeCode,discoverPageAccounts,graphGet,debugToken,
+ getSessionUser,createSession,destroySession,verifyPassword,createUser,tokenHash,validateCsrf,csrfToken,
+ saveMedia,readMedia,createMediaUrl,verifyMediaUrl,mediaContentType} from '@cherrylink/server';
 
-const app=express();app.disable('x-powered-by');app.use(helmet({contentSecurityPolicy:false}));
-app.use(cors({origin:config.CORS_ORIGIN.split(','),methods:['GET','POST','PATCH','DELETE'],allowedHeaders:['Authorization','Content-Type','x-workspace-id']}));
-app.use(express.json({limit:'1mb'}));app.use('/api',rateLimit({windowMs:60000,limit:180,standardHeaders:'draft-8',legacyHeaders:false}));
+const app=express();app.disable('x-powered-by');if(config.NODE_ENV==='production')app.set('trust proxy',1);
+app.use(helmet({contentSecurityPolicy:false}));
+app.use(cors({origin:config.CORS_ORIGIN.split(',').map(v=>v.trim()),credentials:true,methods:['GET','POST','PATCH','DELETE'],allowedHeaders:['Content-Type','x-workspace-id','x-csrf-token']}));
+app.use(express.json({limit:'1mb'}));
+app.use('/api',rateLimit({windowMs:60000,limit:180,standardHeaders:'draft-8',legacyHeaders:false}));
+const loginLimiter=rateLimit({windowMs:15*60000,limit:10,standardHeaders:'draft-8',legacyHeaders:false});
 const asyncRoute=(fn:(req:Request,res:Response)=>Promise<unknown>)=>(req:Request,res:Response,next:NextFunction)=>{Promise.resolve(fn(req,res)).catch(next);};
 const bad=(msg:string,statusCode=400)=>Object.assign(new Error(msg),{statusCode});
+const cookieName='cherrylink_session';
+function sessionFromCookie(req:Request){
+ const entry=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='));
+ return entry?.slice(cookieName.length+1)||'';
+}
+function sessionCookie(token:string,maxAge:number){
+ return [cookieName+'='+token,'Path=/api','HttpOnly','SameSite=Lax',...(config.NODE_ENV==='production'?['Secure']:[]),'Max-Age='+maxAge].join('; ');
+}
 const auth=(req:Request,res:Response,next:NextFunction)=>{(async()=>{
-  const token=req.header('authorization')?.replace(/^Bearer\s+/i,'');if(!token)throw bad('Sign in required',401);
-  const {data,error}=await supabaseAdmin.auth.getUser(token);if(error||!data.user)throw bad('Invalid session',401);
-  res.locals.userId=data.user.id;next();
+ const token=sessionFromCookie(req);if(!token)throw bad('Sign in required',401);
+ const user=await getSessionUser(token);if(!user)throw bad('Session expired; sign in again',401);
+ if(!['GET','HEAD','OPTIONS'].includes(req.method)&&!validateCsrf(token,req.header('x-csrf-token')||''))throw bad('Session verification failed; reload and try again',403);
+ res.locals.userId=user.id;res.locals.user=user;res.locals.sessionToken=token;next();
 })().catch(next);};
 const member=(req:Request,res:Response,next:NextFunction)=>{(async()=>{
-  const id=req.header('x-workspace-id');if(!id||!/^[-a-f0-9]{36}$/i.test(id))throw bad('Select a workspace');
-  await authorize(id,res.locals.userId);res.locals.workspaceId=id;next();
+ const id=req.header('x-workspace-id');if(!id||!/^[-a-f0-9]{36}$/i.test(id))throw bad('Select a workspace');
+ await authorize(id,res.locals.userId);res.locals.workspaceId=id;next();
 })().catch(next);};
 const admin=(req:Request,res:Response,next:NextFunction)=>{authorize(res.locals.workspaceId,res.locals.userId,'ADMIN').then(()=>next()).catch(next);};
 
+app.post('/api/auth/login',loginLimiter,asyncRoute(async(req,res)=>{
+ const email=String(req.body?.email||'').trim().toLowerCase(),password=String(req.body?.password||'');
+ if(!email||!password)throw bad('Email and password required');
+ const {rows}=await pool.query<{id:string;password_hash:string;disabled:number}>('select id,password_hash,disabled from users where email=$1 limit 1',[email]);
+ if(!rows.length||rows[0]!.disabled||!await verifyPassword(password,rows[0]!.password_hash))throw bad('Invalid email or password',401);
+ const token=await createSession(rows[0]!.id);
+ res.setHeader('Set-Cookie',sessionCookie(token,7*24*3600));res.json({ok:true,csrfToken:csrfToken(token)});
+}));
+app.get('/api/auth/session',asyncRoute(async(req,res)=>{
+ const token=sessionFromCookie(req),user=await getSessionUser(token);
+ if(!user){res.status(401).json({authenticated:false});return;}
+ res.json({authenticated:true,user,csrfToken:csrfToken(token)});
+}));
+app.post('/api/auth/logout',auth,asyncRoute(async(_req,res)=>{
+ await destroySession(res.locals.sessionToken);
+ res.setHeader('Set-Cookie',sessionCookie('',0));res.json({ok:true});
+}));
+app.post('/api/auth/accept-invite',loginLimiter,asyncRoute(async(req,res)=>{
+ const token=String(req.body?.token||''),password=String(req.body?.password||'');
+ const {rows}=await pool.query<{workspace_id:string;email:string;role:'ADMIN'|'EDITOR'}>(
+  'select workspace_id,email,role from workspace_invitations where token_hash=$1 and accepted_at is null and expires_at>UTC_TIMESTAMP(3)',[tokenHash(token)]);
+ if(!rows.length)throw bad('Invitation expired or invalid',410);
+ const invite=rows[0]!;
+ const existing=await pool.query('select id from users where email=$1',[invite.email]);
+ if(existing.rows.length)throw bad('Account already exists. Sign in to accept the invitation.',409);
+ const userId=await createUser(invite.email,password);
+ const client=await pool.connect();
+ try{await client.query('begin');
+  const locked=await client.query('select token_hash from workspace_invitations where token_hash=$1 and accepted_at is null and expires_at>UTC_TIMESTAMP(3) for update',[tokenHash(token)]);
+  if(!locked.rows.length)throw bad('Invitation no longer available',410);
+  await client.query('insert into workspace_members(id,workspace_id,user_id,role) values($1,$2,$3,$4)',[newId(),invite.workspace_id,userId,invite.role]);
+  await client.query('update workspace_invitations set accepted_at=UTC_TIMESTAMP(3) where token_hash=$1',[tokenHash(token)]);
+  await client.query('commit');
+ }catch(e){await client.query('rollback');throw e;}finally{client.release();}
+ const session=await createSession(userId);res.setHeader('Set-Cookie',sessionCookie(session,7*24*3600));
+ res.status(201).json({ok:true,csrfToken:csrfToken(session)});
+}));
+app.post('/api/auth/join-workspace',auth,asyncRoute(async(req,res)=>{
+ const token=String(req.body?.token||'');
+ const client=await pool.connect();
+ try{await client.query('begin');
+  const inv=await client.query<{workspace_id:string;email:string;role:'ADMIN'|'EDITOR'}>(
+   'select workspace_id,email,role from workspace_invitations where token_hash=$1 and accepted_at is null and expires_at>UTC_TIMESTAMP(3) for update',[tokenHash(token)]);
+  if(!inv.rows.length||inv.rows[0]!.email.toLowerCase()!==res.locals.user.email.toLowerCase())throw bad('Invitation expired or does not match your email',403);
+  await client.query('insert into workspace_members(id,workspace_id,user_id,role) values($1,$2,$3,$4) on duplicate key update role=values(role)',[newId(),inv.rows[0]!.workspace_id,res.locals.userId,inv.rows[0]!.role]);
+  await client.query('update workspace_invitations set accepted_at=UTC_TIMESTAMP(3) where token_hash=$1',[tokenHash(token)]);
+  await client.query('commit');res.json({ok:true});
+ }catch(e){await client.query('rollback');throw e;}finally{client.release();}
+}));
 app.get('/healthz',(_req,res)=>res.json({status:'ok'}));
 app.get('/readyz',asyncRoute(async(_req,res)=>{await pool.query('select 1');res.json({status:'ready'});}));
 app.get('/api/me',auth,asyncRoute(async(_req,res)=>{const {rows}=await pool.query(`select w.id,w.name,w.timezone,m.role from workspace_members m join workspaces w on w.id=m.workspace_id where m.user_id=$1 order by w.created_at`,[res.locals.userId]);res.json({workspaces:rows});}));
