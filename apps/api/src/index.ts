@@ -212,20 +212,32 @@ app.post('/api/media',auth,member,upload.single('media'),asyncRoute(async(req,re
     const m=await sharp(prepared).metadata();detail={...detail,width:m.width||detail.width,height:m.height||detail.height};
   }
   const hash=createHash('sha256').update(f.buffer).digest('hex');const id=randomUUID();const path=`${res.locals.workspaceId}/${id}/original.${sniff.ext==='jpg'?'jpg':sniff.ext==='png'?'png':'mp4'}`;
-  const {error}=await supabaseAdmin.storage.from(config.SUPABASE_STORAGE_BUCKET).upload(path,f.buffer,{contentType:sniff.mime,upsert:false});if(error)throw bad('Private media storage unavailable',503);
+  await saveMedia(path,f.buffer);
   const preparedPath=prepared?`${res.locals.workspaceId}/${id}/prepared.jpg`:null;
-  if(prepared&&preparedPath){const {error:prepError}=await supabaseAdmin.storage.from(config.SUPABASE_STORAGE_BUCKET).upload(preparedPath,prepared,{contentType:'image/jpeg',upsert:false});if(prepError)throw bad('Image preparation storage unavailable',503);}
-  const {rows}=await pool.query(`insert into media_assets(id,workspace_id,storage_path,original_filename,mime_type,size_bytes,width,height,duration_seconds,checksum_sha256,metadata)
-    values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id`,[id,res.locals.workspaceId,path,f.originalname.slice(0,200),sniff.mime,f.size,detail.width,detail.height,detail.duration,hash,JSON.stringify({...detail,prepared_path:preparedPath})]);
-  await audit(res.locals.workspaceId,res.locals.userId,'media_asset',id,'UPLOAD');res.status(201).json({id:rows[0]!.id,mime_type:sniff.mime});
+  if(prepared&&preparedPath)await saveMedia(preparedPath,prepared);
+  await pool.query(`insert into media_assets(id,workspace_id,storage_path,original_filename,mime_type,size_bytes,width,height,duration_seconds,checksum_sha256,metadata)
+    values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[id,res.locals.workspaceId,path,f.originalname.slice(0,200),sniff.mime,f.size,detail.width,detail.height,detail.duration,hash,JSON.stringify({...detail,prepared_path:preparedPath})]);
+  await audit(res.locals.workspaceId,res.locals.userId,'media_asset',id,'UPLOAD');res.status(201).json({id,mime_type:sniff.mime});
 }));
 app.get('/api/media',auth,member,asyncRoute(async(_req,res)=>{
   const {rows}=await pool.query('select id,original_filename,mime_type,width,height,duration_seconds,created_at from media_assets where workspace_id=$1 order by created_at desc limit 100',[res.locals.workspaceId]);res.json({media:rows});
 }));
 app.get('/api/media/:id/preview',auth,member,asyncRoute(async(req,res)=>{
   const {rows}=await pool.query<{storage_path:string}>(`select storage_path from media_assets where id=$1 and workspace_id=$2`,[req.params.id,res.locals.workspaceId]);if(!rows.length)throw bad('Media not found',404);
-  const {data,error}=await supabaseAdmin.storage.from(config.SUPABASE_STORAGE_BUCKET).createSignedUrl(rows[0]!.storage_path,600);if(error||!data)throw bad('Media preview temporarily unavailable',503);
-  res.json({url:data.signedUrl});
+  res.json({url:createMediaUrl(req.params.id!,'original',600)});
+}));
+app.get('/api/public/media/:id/:variant',asyncRoute(async(req,res)=>{
+ const id=String(req.params.id),variant=String(req.params.variant);
+ if(!verifyMediaUrl(id,variant,String(req.query.expires||''),String(req.query.sig||'')))throw bad('Expired or invalid media URL',403);
+ const {rows}=await pool.query<{storage_path:string;metadata:any}>('select storage_path,metadata from media_assets where id=$1',[id]);
+ if(!rows.length)throw bad('Media not found',404);
+ const metadata=typeof rows[0]!.metadata==='string'?JSON.parse(rows[0]!.metadata):rows[0]!.metadata;
+ const path=variant==='prepared'?metadata?.prepared_path:rows[0]!.storage_path;
+ if(!path)throw bad('Media variant unavailable',404);
+ const bytes=await readMedia(path);
+ res.setHeader('Content-Type',mediaContentType(path));
+ res.setHeader('Cache-Control','private, max-age=120');
+ res.send(bytes);
 }));
 app.post('/api/posts',auth,member,asyncRoute(async(req,res)=>{
   const parsed=createPostSchema.safeParse(req.body);if(!parsed.success)throw bad(parsed.error.issues[0]?.message||'Invalid post');
