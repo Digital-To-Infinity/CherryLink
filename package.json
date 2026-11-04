@@ -1,6 +1,11 @@
 {
-  "name": "cherrylink", "version": "0.1.0", "private": true,
-  "workspaces": ["apps/*", "packages/*"],
+  "name": "cherrylink",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "build:libs": "tsc -b packages/shared packages/server",
     "dev:api": "npm run build:libs && npm run dev -w @cherrylink/api",
@@ -8,8 +13,16 @@
     "dev:worker": "npm run build:libs && npm run dev -w @cherrylink/worker",
     "typecheck": "tsc -b packages/shared packages/server apps/api apps/worker apps/web",
     "test": "node --import tsx --test packages/server/test/*.test.ts",
-    "build": "npm run build:libs && npm run build -w @cherrylink/web && npm run build -w @cherrylink/api && npm run build -w @cherrylink/worker"
+    "build": "npm run build:libs && npm run build -w @cherrylink/web && npm run build -w @cherrylink/api && npm run build -w @cherrylink/worker",
+    "admin:create": "npm run build:libs && node --import tsx scripts/create-admin.ts",
+    "mysql:check": "npm run build:libs && node --import tsx scripts/mysql-check.ts"
   },
-  "devDependencies": {"typescript":"^5.9.3","tsx":"^4.20.6","@types/node":"^22.18.0"},
-  "engines":{"node":">=22"}
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "tsx": "^4.20.6",
+    "@types/node": "^22.18.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
 }

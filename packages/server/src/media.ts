@@ -1,9 +1,10 @@
 import {createHmac,timingSafeEqual} from 'node:crypto';
-import {resolve,sep,join} from 'node:path';
+import {resolve,sep,isAbsolute} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {mkdir,writeFile,readFile} from 'node:fs/promises';
 import {config} from './config.js';
 export type MediaVariant='original'|'prepared';
-const root=resolve(config.MEDIA_DIR);
+const root=isAbsolute(config.MEDIA_DIR)?resolve(config.MEDIA_DIR):resolve(fileURLToPath(new URL('../../../',import.meta.url)),config.MEDIA_DIR);
 export function resolveMediaPath(relativePath:string){
  // Explicit filename allowlist; never resolve arbitrary user-provided paths.
  if(!/^[0-9a-f-]{36}\/[0-9a-f-]{36}\/(original\.(jpg|png|mp4)|prepared\.jpg)$/.test(relativePath))throw Error('Unsafe media storage path');
