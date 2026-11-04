@@ -1,6 +1,7 @@
 import {config,pool,newId,createMediaUrl,decrypt,graphGet,graphPost,MetaError} from '@cherrylink/server';
 import {aggregateStatus,retryDelaySeconds,type PublishingStatus} from '@cherrylink/shared';
 import type {DbClient} from '@cherrylink/server';
+import {randomUUID} from 'node:crypto';
 
 interface Delivery {
  job_id:string;target_id:string;post_id:string;workspace_id:string;social_account_id:string;platform:'FACEBOOK'|'INSTAGRAM';
@@ -8,6 +9,7 @@ interface Delivery {
  attempt_count:number;media_asset_id:string|null;mime_type:string|null;storage_path:string|null;prepared_path:string|null;connection_status:string;encrypted_token:string|null;
 }
 const sleep=(ms:number)=>new Promise<void>(r=>setTimeout(r,ms));let shuttingDown=false;
+const runtimeWorkerId=config.WORKER_ID+'-'+process.pid+'-'+randomUUID().slice(0,8);
 function classify(err:unknown,phase:'preflight'|'nonfinal'|'final'):{status:PublishingStatus;code:string;message:string;delay:number}{
  const e=err instanceof MetaError?err:null;
  const msg=e?`Meta rejected publishing (code ${e.code??'unknown'}).`:(err instanceof Error?err.message.slice(0,160):'Publishing error');
@@ -30,12 +32,15 @@ async function claim(client:DbClient):Promise<Delivery|null>{
    where j.status='QUEUED' and j.available_at<=UTC_TIMESTAMP(3) and t.publishing_status in ('SCHEDULED','RETRY_WAIT','READY')
    order by j.available_at,j.id limit 1 for update skip locked`);
   const d=selected.rows[0];if(!d){await client.query('commit');return null;}
-  const held=await client.query<{worker_id:string}>('select worker_id from account_publish_leases where social_account_id=$1 and leased_until>UTC_TIMESTAMP(3) for update',[d.social_account_id]);
-  if(held.rows.length){await client.query('commit');return null;}
+  // Atomic lease acquisition: a concurrent worker must NEVER overwrite a valid lease.
   await client.query(`insert into account_publish_leases(social_account_id,worker_id,leased_until)
     values($1,$2,DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE))
-    on duplicate key update worker_id=values(worker_id),leased_until=values(leased_until)`,[d.social_account_id,config.WORKER_ID]);
-  await client.query(`update publication_jobs set status='RUNNING',locked_until=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE),worker_id=$2,attempt_count=attempt_count+1,updated_at=UTC_TIMESTAMP(3) where id=$1`,[d.job_id,config.WORKER_ID]);
+    on duplicate key update
+      worker_id=IF(leased_until<UTC_TIMESTAMP(3),values(worker_id),worker_id),
+      leased_until=IF(leased_until<UTC_TIMESTAMP(3),values(leased_until),leased_until)`,[d.social_account_id,runtimeWorkerId]);
+  const {rows:leases}=await client.query<{worker_id:string}>('select worker_id from account_publish_leases where social_account_id=$1 for update',[d.social_account_id]);
+  if(leases[0]?.worker_id!==runtimeWorkerId){await client.query('commit');return null;}
+  await client.query(`update publication_jobs set status='RUNNING',locked_until=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE),worker_id=$2,attempt_count=attempt_count+1,updated_at=UTC_TIMESTAMP(3) where id=$1`,[d.job_id,runtimeWorkerId]);
   await client.query(`update post_targets set publishing_status='PREPARING',request_stage='PREFLIGHT',updated_at=UTC_TIMESTAMP(3) where id=$1`,[d.target_id]);
   await client.query(`insert into publication_attempts(id,post_target_id,attempt_number,provider_operation,outcome) values($1,$2,$3,'PREFLIGHT','STARTED')`,[newId(),d.target_id,d.attempt_count+1]);
   await client.query('commit');return {...d,attempt_count:d.attempt_count+1};
@@ -56,7 +61,7 @@ async function complete(d:Delivery,status:PublishingStatus,opts:{postId?:string;
   await client.query(`update publication_jobs set status=$2,available_at=case when $2='QUEUED' then DATE_ADD(UTC_TIMESTAMP(3),INTERVAL $3 SECOND) else available_at end,
     locked_until=null,worker_id=null,updated_at=UTC_TIMESTAMP(3) where id=$1`,[d.job_id,jobStatus,opts.delaySeconds??0]);
   await client.query('update publication_attempts set finished_at=UTC_TIMESTAMP(3),outcome=$3,safe_error_code=$4 where post_target_id=$1 and attempt_number=$2',[d.target_id,d.attempt_count,status,opts.code??null]);
-  await client.query('delete from account_publish_leases where social_account_id=$1 and worker_id=$2',[d.social_account_id,config.WORKER_ID]);
+  await client.query('delete from account_publish_leases where social_account_id=$1 and worker_id=$2',[d.social_account_id,runtimeWorkerId]);
   const {rows}=await client.query<{publishing_status:PublishingStatus}>('select publishing_status from post_targets where post_id=$1',[d.post_id]);
   await client.query('update posts set lifecycle_status=$2,updated_at=UTC_TIMESTAMP(3) where id=$1',[d.post_id,aggregateStatus(rows.map(r=>r.publishing_status))]);
   await client.query('commit');
@@ -201,7 +206,7 @@ async function reconcileUnknown(){
 let reconcileCounter=0;
 async function tick(){
  await pool.query("insert into worker_heartbeats(worker_id,last_seen_at,status) values($1,UTC_TIMESTAMP(3),$2) on duplicate key update last_seen_at=UTC_TIMESTAMP(3),status=values(status)",
-  [config.WORKER_ID,config.LIVE_PUBLISHING_ENABLED==='true'?'ACTIVE':'DISABLED']);
+  [runtimeWorkerId,config.LIVE_PUBLISHING_ENABLED==='true'?'ACTIVE':'DISABLED']);
  if(config.LIVE_PUBLISHING_ENABLED!=='true')return;
  await markOrphansUnknown();if(++reconcileCounter%6===0)await reconcileUnknown();
  const client=await pool.connect();let d:Delivery|null=null;
@@ -209,14 +214,14 @@ async function tick(){
  if(!d)return;
  const locked=d;
  const timer=setInterval(()=>{(async()=>{
-  await pool.query("update publication_jobs set locked_until=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE) where id=$1 and worker_id=$2 and status='RUNNING'",[locked.job_id,config.WORKER_ID]);
-  await pool.query("update account_publish_leases set leased_until=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE) where social_account_id=$1 and worker_id=$2",[locked.social_account_id,config.WORKER_ID]);
+  await pool.query("update publication_jobs set locked_until=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE) where id=$1 and worker_id=$2 and status='RUNNING'",[locked.job_id,runtimeWorkerId]);
+  await pool.query("update account_publish_leases set leased_until=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 10 MINUTE) where social_account_id=$1 and worker_id=$2",[locked.social_account_id,runtimeWorkerId]);
  })().catch(()=>{});},30000);
  try{await processDelivery(d);}finally{clearInterval(timer);}
 }
 process.on('SIGTERM',()=>{shuttingDown=true;});process.on('SIGINT',()=>{shuttingDown=true;});
 async function main(){
- console.info('CherryLink MySQL worker online',{workerId:config.WORKER_ID,live:config.LIVE_PUBLISHING_ENABLED});
+ console.info('CherryLink MySQL worker online',{workerId:runtimeWorkerId,live:config.LIVE_PUBLISHING_ENABLED});
  while(!shuttingDown){try{await tick();}catch(e){console.error('Worker tick failed',{type:e instanceof Error?e.name:'unknown'});}if(!shuttingDown)await sleep(config.WORKER_POLL_MS);}
  await pool.end();
 }
